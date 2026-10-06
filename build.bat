@@ -51,6 +51,9 @@ copy /y "%XSRC%\Win32\dinput.dll" "%PKG%\files\xidi\dinput.dll" >nul
 copy /y "%XSRC%\Win32\Xidi.32.dll" "%PKG%\files\xidi\Xidi.32.dll" >nul
 copy /y "%XSRC%\LICENSE" "%PKG%\files\xidi\LICENSE" >nul
 copy /y "%ROOT%README.md" "%PKG%\README.md" >nul
+mkdir "%PKG%\docs"
+copy /y "%ROOT%docs\MODDING.md" "%PKG%\docs\MODDING.md" >nul
+copy /y "%ROOT%config\mafia-1.0.profile.json" "%PKG%\files\mafia-1.0.profile.json" >nul
 copy /y "%ROOT%LICENSE" "%PKG%\LICENSE" >nul
 copy /y "%ROOT%THIRD_PARTY_NOTICES.md" "%PKG%\THIRD_PARTY_NOTICES.md" >nul
 

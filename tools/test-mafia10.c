@@ -84,6 +84,58 @@ static int __fastcall TestLine(void *collision, void *unused, const Vector3 *fro
     return 0;
 }
 
+static int testFreerideModel, testFreerideFlags, testPoliceEnabled, testLoopSession;
+static float testFreerideCars, testFreeridePedestrians, testFreeridePolice;
+
+static void __stdcall TestFreerideStore(int model, int flags, float cars,
+                                       float pedestrians, float police)
+{
+    testFreerideModel = model;
+    testFreerideFlags = flags;
+    testFreerideCars = cars;
+    testFreeridePedestrians = pedestrians;
+    testFreeridePolice = police;
+}
+
+static void __fastcall TestPoliceState(void *manager, void *unused, int enabled,
+                                      int tier, int cacheFlag)
+{
+    (void)manager;
+    (void)unused;
+    (void)tier;
+    (void)cacheFlag;
+    testPoliceEnabled = enabled;
+}
+
+static void __cdecl TestGameLoop(void)
+{
+    testLoopSession = g_tutorialFreeride;
+}
+
+static int testOrdinaryPanic, testMegaPanic, testMegaSeverity;
+
+static void __fastcall TestOrdinaryPanic(void *pedestrian, void *unused)
+{
+    (void)pedestrian;
+    (void)unused;
+    ++testOrdinaryPanic;
+}
+
+static void __fastcall TestMegaPanic(void *pedestrian, void *unused, int severity)
+{
+    (void)pedestrian;
+    (void)unused;
+    ++testMegaPanic;
+    testMegaSeverity = severity;
+}
+
+static void __fastcall TestEntityTick(void *entity, void *unused, DWORD delta)
+{
+    (void)entity;
+    (void)unused;
+    (void)delta;
+}
+
 int main(void)
 {
     static const BYTE setter[] = {
@@ -98,7 +150,7 @@ int main(void)
     };
     static const BYTE accessor[] = {0x8B, 0x81, 0xE4, 0, 0, 0, 0xC3};
     static const BYTE line[] = {0xE9, 0x6B, 0x2E, 0xFF, 0xFF};
-    BYTE mission[0x100] = {0}, game[0x100] = {0}, player[0xB00] = {0};
+    BYTE mission[0x100] = {0}, game[0x200] = {0}, player[0xB00] = {0};
     BYTE npc[0x1000] = {0}, camera[0x100] = {0};
     uintptr_t actors[2], worldAddress, playerAddress;
     Vector3 position, forward;
@@ -141,6 +193,23 @@ int main(void)
     Check(FindNearestPed((uintptr_t)mission, (uintptr_t)player, position,
                         (Vector3){0.0f, 0.0f, 1.0f}, &forward) == (uintptr_t)npc,
           "target acquisition from mission actor list");
+        {
+          uintptr_t temporary[1] = {(uintptr_t)npc};
+          uintptr_t listed, count;
+          *(uintptr_t *)(mission + WORLD_LIST_END_OFFSET) = (uintptr_t)(actors + 1);
+          *(uintptr_t *)(game + 0x124u) = (uintptr_t)temporary;
+          *(uintptr_t *)(game + 0x128u) = (uintptr_t)(temporary + 1);
+          Check(FindNearestPed((uintptr_t)mission, (uintptr_t)player, position,
+                        (Vector3){0.0f, 0.0f, 1.0f}, &forward) == (uintptr_t)npc,
+              "aim acquires a spawned temporary enemy");
+          Check(TargetStillValid((uintptr_t)mission, (uintptr_t)player, (uintptr_t)npc, &forward),
+              "aim retains lock on a temporary enemy");
+          *(uintptr_t *)(mission + WORLD_LIST_END_OFFSET) = (uintptr_t)(actors + 2);
+          Check(ListBounds((uintptr_t)mission, &listed, &count) && count == 2,
+              "mission and temporary actor lists are deduplicated");
+          *(uintptr_t *)(game + 0x124u) = 0;
+          *(uintptr_t *)(game + 0x128u) = 0;
+        }
     InstallCrouchHook();
     Check(g_originalCrouch != NULL, "verified player callsite installed");
     g_crouch = AimCrouch;
@@ -181,6 +250,84 @@ int main(void)
     Check(g_crouchPlayer == 0 && g_crouchDesired == -1, "driving resets crouch latch");
     game[0x40] = 0;
     Check(!GetWorld(&worldAddress, &playerAddress), "unloaded world rejected");
+        {
+          void *sharedVtable[39] = {0};
+          sharedVtable[13] = (void *)TestEntityTick;
+          *(void ***)npc = sharedVtable;
+          g_originalEntityTick = TestEntityTick;
+          Check(BindEnemyInstanceAi((uintptr_t)npc) && *(void ***)npc == g_enemyVtable &&
+              sharedVtable[13] == (void *)TestEntityTick,
+              "enemy AI hook changes only its instance, not shared NPC vtable");
+          g_originalEntityTick = NULL;
+          g_pedestrianPanic = TestOrdinaryPanic;
+          g_pedestrianMegaPanic = TestMegaPanic;
+          g_tutorialFreeride = 1;
+          TutorialPedestrianPanic(NULL, NULL, 3);
+          Check(testOrdinaryPanic == 1 && testMegaPanic == 0,
+              "tutorial gunfire panic uses fleeing instead of collapse");
+          g_tutorialFreeride = 0;
+          TutorialPedestrianPanic(NULL, NULL, 2);
+          Check(testMegaPanic == 1 && testMegaSeverity == 2,
+              "other modes retain native panic severity");
+        }
+        {
+          HostVector3 playerPosition = {10.0f, 2.0f, 20.0f};
+          HostVector3 playerDirection = {0.0f, 0.0f, 2.0f};
+          HostVector3 spawnPosition, spawnDirection;
+          Check(EnemySpawnPose(playerPosition, playerDirection, &spawnPosition, &spawnDirection) &&
+              spawnPosition.x == 10.0f && spawnPosition.y == 2.0f && spawnPosition.z == 26.0f &&
+              spawnDirection.z == 1.0f, "enemy spawns six metres ahead facing away from player");
+          playerDirection.z = 0.0f;
+          Check(!EnemySpawnPose(playerPosition, playerDirection, &spawnPosition, &spawnDirection),
+              "enemy spawn rejects missing player direction");
+          playerDirection.z = 1.0f;
+          Check(!EnemyMayNotice(spawnPosition, playerDirection, playerPosition),
+              "enemy cannot notice player standing behind him");
+          playerPosition.z = 30.0f;
+          Check(EnemyMayNotice(spawnPosition, playerDirection, playerPosition),
+              "player in front may trigger native visual detection");
+        }
+    {
+        static const BYTE menu[] = {0xB8, 0x11, 0, 0, 0, 0xC3};
+        static const BYTE introMenu[] = {0xB8, 0x16, 0, 0, 0, 0xC3};
+        static const BYTE store[] = {
+            0x8B, 0x44, 0x24, 0x04, 0x8B, 0x4C, 0x24, 0x08,
+            0x8B, 0x54, 0x24, 0x0C, 0xA3, 0xD0, 0x1E, 0x67, 0
+        };
+        static const BYTE policeCall[] = {0xE8, 0xE2, 0xC7, 0, 0};
+        static const BYTE loopCall[] = {0xE8, 0x67, 0xF5, 0xFF, 0xFF};
+        int (__cdecl *menuAction)(void) = (int (__cdecl *)(void))(testImage + 0x176AA7u);
+        memcpy(testImage + 0x176AA7u, menu, sizeof(menu));
+        memcpy(testImage + 0x176A85u, introMenu, sizeof(introMenu));
+        memcpy(testImage + 0x251338u, "tutorial", 9);
+        memcpy(testImage + 0x2512CCu, "freeitaly", 10);
+        memcpy(testImage + 0x1608F0u, store, sizeof(store));
+        memcpy(testImage + 0x1C01F9u, policeCall, sizeof(policeCall));
+        memcpy(testImage + 0x1F9FD4u, loopCall, sizeof(loopCall));
+        *(uintptr_t *)(testImage + 0x1FA260u) = (uintptr_t)testImage + 0x1F9C8Au;
+        InstallTutorialHook();
+        Check(testImage[0x176AA7u] == 0xB8, "tutorial redirect rejects wrong FreeItaly dispatch");
+        *(uintptr_t *)(testImage + 0x1FA28Cu) = (uintptr_t)testImage + 0x1F9D7Au;
+        InstallTutorialHook();
+          Check(testImage[0x176AA7u] == 0xE8, "tutorial selector hook installed");
+          Check(memcmp(testImage + 0x176A85u, introMenu, sizeof(introMenu)) == 0,
+              "intro menu action remains untouched");
+        g_freerideStore = TestFreerideStore;
+        g_policeState = TestPoliceState;
+        g_gameLoop = TestGameLoop;
+        TutorialPoliceState(NULL, NULL, 1, 0, 0);
+        Check(testPoliceEnabled == 1, "ordinary missions retain police activation");
+        Check(menuAction() == 0x1C, "tutorial selects native Little Italy freeride");
+        Check(testFreerideModel == 1 && testFreerideFlags == 0 && testFreerideCars == 1.0f &&
+              testFreeridePedestrians == 1.0f && testFreeridePolice == 0.0f,
+              "tutorial keeps traffic but disables police vehicles");
+        TutorialPoliceState(NULL, NULL, 1, 0, 0);
+        Check(testPoliceEnabled == 0, "tutorial freeride cannot activate pursuit manager");
+        TutorialGameLoop();
+        Check(testLoopSession == 1 && !g_tutorialFreeride, "session override clears after game loop");
+        TutorialPoliceState(NULL, NULL, 1, 0, 0);
+        Check(testPoliceEnabled == 1, "police behavior restored for subsequent sessions");
+    }
     VirtualFree(testImage, 0, MEM_RELEASE);
     printf("Failures: %d\n", failures);
     return failures ? 1 : 0;

@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
+#include <float.h>
 
 #if !defined(_M_IX86)
 #error MafiaAimHost must be built for Win32/x86.
@@ -27,6 +29,15 @@ static HMODULE g_logic;
 static AimMouseFn volatile g_aim;
 static AimCrouchFn volatile g_crouch;
 static HumanCrouchFn g_originalCrouch;
+typedef void (__stdcall *FreerideStoreFn)(int model, int flags, float cars,
+                                        float pedestrians, float police);
+static FreerideStoreFn g_freerideStore;
+typedef void (__fastcall *PoliceStateFn)(void *manager, void *unused, int enabled,
+                                       int vehicleTier, int cacheFlag);
+typedef void (__cdecl *GameLoopFn)(void);
+static PoliceStateFn g_policeState;
+static GameLoopFn g_gameLoop;
+static int g_tutorialFreeride;
 static volatile LONG g_inFlight;
 static volatile LONG g_mouseCalls;
 static GetDeviceStateFn g_stateA, g_stateW;
@@ -294,11 +305,340 @@ static void InstallCrouchHook(void)
     Log("Mafia 1.0 player crouch call hooked");
 }
 
+static int __cdecl TutorialFreerideAction(void)
+{
+    g_freerideStore(1, 0, 1.0f, 1.0f, 0.0f);
+    g_tutorialFreeride = 1;
+    Log("Tutorial redirected to FreeItaly: police disabled for this session");
+    return 0x1C;
+}
+
+static void __fastcall TutorialPoliceState(void *manager, void *unused, int enabled,
+                                          int vehicleTier, int cacheFlag)
+{
+    (void)unused;
+    g_policeState(manager, NULL, g_tutorialFreeride ? 0 : enabled, vehicleTier, cacheFlag);
+}
+
+typedef struct HostVector3 { float x, y, z; } HostVector3;
+typedef void (__fastcall *HostEntityTickFn)(void *entity, void *unused, DWORD delta);
+typedef void *(__fastcall *HostCreateActorFn)(void *mission, void *unused, int kind);
+typedef int (__fastcall *HostModelOpenFn)(void *cache, void *unused, void *model,
+                                        const char *name, int, int, int, int);
+typedef void (__fastcall *HostObjectFn)(void *object, void *unused);
+typedef void (__fastcall *HostObjectArgFn)(void *object, void *unused, void *argument);
+typedef void (__fastcall *HostFlagFn)(void *object, void *unused, int flag);
+typedef void (__fastcall *HostPositionFn)(void *frame, void *unused, const HostVector3 *position);
+typedef int (__fastcall *HostPlayAnimFn)(void *human, void *unused, const char *name, int loop, int simple);
+typedef unsigned char (__fastcall *HostCanSeeFn)(void *sensors, void *unused, void *actor);
+typedef void (__fastcall *HostForceAiFn)(void *entity, void *unused, int state, int, int, float);
+typedef int (__fastcall *HostInventoryFn)(void *inventory, void *unused, const DWORD *item, int select);
+typedef void *(__stdcall *HostCreateFrameFn)(void *driver, int kind);
+typedef void (__stdcall *HostFrameNameFn)(void *frame, const char *name);
+typedef void (__stdcall *HostFrameLinkFn)(void *frame, void *parent, int flags);
+typedef void (__stdcall *HostFrameDirFn)(void *frame, const HostVector3 *direction, int flags);
+typedef void (__stdcall *HostFrameOnFn)(void *frame, int enabled);
+typedef void (__stdcall *HostFrameReleaseFn)(void *frame);
+
+static HostEntityTickFn g_originalEntityTick;
+static void *g_enemyVtable[39];
+static uintptr_t g_tutorialEnemy, g_tutorialCigarette;
+static int g_enemyAlerted;
+static DWORD g_enemyAnimElapsed;
+
+static void *HostVirtual(uintptr_t object, unsigned int byteOffset)
+{
+    return (void *)*(uintptr_t *)(*(uintptr_t *)object + byteOffset);
+}
+
+static uintptr_t CreateEnemyModel(const char *name, const char *modelName)
+{
+    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    uintptr_t mission = *(uintptr_t *)(base + 0x25115Cu);
+    uintptr_t scene = *(uintptr_t *)(mission + 0x10u);
+    uintptr_t driver = *(uintptr_t *)(base + 0x2F9520u);
+    uintptr_t model = (uintptr_t)((HostCreateFrameFn)HostVirtual(driver, 0x4C))( (void *)driver, 9);
+    if (!model)
+        return 0;
+    ((HostFrameNameFn)HostVirtual(model, 0x28))((void *)model, name);
+    if (((HostModelOpenFn)(base + 0x048940u))((void *)(base + 0x2F9418u), NULL,
+                                          (void *)model, modelName, 0, 0, 0, 0) < 0)
+    {
+        ((HostFrameReleaseFn)HostVirtual(model, 0))((void *)model);
+        return 0;
+    }
+    ((HostFrameLinkFn)HostVirtual(model, 0x2C))((void *)model,
+                                             *(void **)(scene + 0x210u), 0);
+    return model;
+}
+
+static int EnemySpawnPose(HostVector3 playerPosition, HostVector3 playerDirection,
+                          HostVector3 *position, HostVector3 *direction)
+{
+    float lengthSquared = playerDirection.x * playerDirection.x +
+                          playerDirection.z * playerDirection.z;
+    float inverse;
+    if (!_finite(lengthSquared) || lengthSquared < 0.0001f ||
+        !_finite(playerPosition.x) || !_finite(playerPosition.y) || !_finite(playerPosition.z))
+        return 0;
+    inverse = 1.0f / sqrtf(lengthSquared);
+    direction->x = playerDirection.x * inverse;
+    direction->y = 0.0f;
+    direction->z = playerDirection.z * inverse;
+    position->x = playerPosition.x + direction->x * 6.0f;
+    position->y = playerPosition.y;
+    position->z = playerPosition.z + direction->z * 6.0f;
+    return 1;
+}
+
+static int EnemyMayNotice(HostVector3 position, HostVector3 facing, HostVector3 playerPosition)
+{
+    float deltaX = playerPosition.x - position.x;
+    float deltaZ = playerPosition.z - position.z;
+    return deltaX * facing.x + deltaZ * facing.z > 0.0f;
+}
+
+static void SpawnTutorialEnemy(void)
+{
+    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    uintptr_t mission = *(uintptr_t *)(base + 0x25115Cu);
+    uintptr_t game = *(uintptr_t *)(mission + 0x24u);
+    uintptr_t player = *(uintptr_t *)(game + 0xE4u);
+    uintptr_t frame, entity, hand;
+    HostVector3 position, direction;
+    DWORD weapon[6] = {9, 7, 35, 0, 0, 0};
+    if (!player || !EnemySpawnPose(*(HostVector3 *)(player + 0x24u),
+                                  *(HostVector3 *)(player + 0x30u), &position, &direction))
+        return;
+    frame = CreateEnemyModel("MafiaRpgEnemy", "SamHIGH.i3d");
+    if (!frame)
+    {
+        Log("Enemy spawn failed: SamHIGH model unavailable");
+        return;
+    }
+    ((HostPositionFn)(base + 0x05F000u))((void *)frame, NULL, &position);
+    ((HostFrameDirFn)HostVirtual(frame, 0x0C))((void *)frame, &direction, 0);
+    entity = (uintptr_t)((HostCreateActorFn)(base + 0x1FED70u))((void *)mission, NULL, 0x1B);
+    if (!entity)
+    {
+        ((HostFrameReleaseFn)HostVirtual(frame, 0))((void *)frame);
+        return;
+    }
+    if (!((HostCanSeeFn)HostVirtual(entity, 0x48))((void *)entity, NULL, (void *)frame))
+    {
+        Log("Enemy spawn failed: entity model initialization rejected");
+        ((HostFrameReleaseFn)HostVirtual(frame, 0))((void *)frame);
+        return;
+    }
+    *(DWORD *)(entity + 0x5FCu) = 0x10;
+    ((HostObjectArgFn)(base + 0x1E3220u))((void *)game, NULL, (void *)entity);
+    ((HostInventoryFn)(base + 0x15B2D0u))((void *)(entity + 0x480u), NULL, weapon, 0);
+    ((HostObjectFn)(base + 0x09F180u))((void *)entity, NULL);
+    ((HostFlagFn)(base + 0x1C9010u))((void *)entity, NULL, 1);
+    g_tutorialEnemy = entity;
+    g_enemyAlerted = 0;
+    g_enemyAnimElapsed = 0;
+    hand = *(uintptr_t *)(entity + 0x570u);
+    if (hand)
+    {
+        g_tutorialCigarette = CreateEnemyModel("MafiaRpgCigarette", "2cigaro.i3d");
+        if (g_tutorialCigarette)
+        {
+            HostVector3 origin = {0.0f, 0.0f, 0.0f};
+            ((HostFrameLinkFn)HostVirtual(g_tutorialCigarette, 0x2C))(
+                (void *)g_tutorialCigarette, (void *)hand, 0);
+            ((HostPositionFn)(base + 0x05F000u))((void *)g_tutorialCigarette, NULL, &origin);
+        }
+    }
+    ((HostPlayAnimFn)(base + 0x0A63F0u))((void *)entity, NULL, "KoureniAutoStativ.i3d", 1, 0);
+    ((HostFrameReleaseFn)HostVirtual(frame, 0))((void *)frame);
+    Log("Mafioso spawned: actor=%p group=%lu position=%.2f,%.2f,%.2f; awaiting visual contact",
+        (void *)entity, *(DWORD *)(entity + 0xF4Cu), position.x, position.y, position.z);
+}
+
+static void __fastcall TutorialEnemyTick(void *actor, void *unused, DWORD delta)
+{
+    uintptr_t entity = (uintptr_t)actor;
+    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    (void)unused;
+    g_originalEntityTick(actor, NULL, delta);
+    if (!g_tutorialFreeride || entity != g_tutorialEnemy || g_enemyAlerted ||
+        *(float *)(entity + 0x644u) <= 0.01f)
+        return;
+    ((HostObjectFn)(base + 0x0107D0u))((void *)(entity + 0xB04u), NULL);
+    {
+        uintptr_t mission = *(uintptr_t *)(base + 0x25115Cu);
+        uintptr_t game = *(uintptr_t *)(mission + 0x24u);
+        uintptr_t player = *(uintptr_t *)(game + 0xE4u);
+        if (player && EnemyMayNotice(*(HostVector3 *)(entity + 0x24u),
+                                    *(HostVector3 *)(entity + 0x30u),
+                                    *(HostVector3 *)(player + 0x24u)) &&
+            ((HostCanSeeFn)(base + 0x0101B0u))((void *)(entity + 0xBB4u), NULL, (void *)player))
+        {
+            g_enemyAlerted = 1;
+            if (g_tutorialCigarette)
+                ((HostFrameOnFn)HostVirtual(g_tutorialCigarette, 0x24))((void *)g_tutorialCigarette, 0);
+            ((HostObjectFn)(base + 0x09D840u))((void *)entity, NULL);
+            ((HostFlagFn)(base + 0x1C9010u))((void *)entity, NULL, 0);
+            ((HostForceAiFn)(base + 0x02E650u))((void *)entity, NULL, 3, 0, 0, 1.0f);
+            Log("Mafioso saw the player: smoking stopped, combat AI enabled");
+            return;
+        }
+    }
+    g_enemyAnimElapsed += delta;
+    if (g_enemyAnimElapsed >= 7000)
+    {
+        g_enemyAnimElapsed = 0;
+        ((HostPlayAnimFn)(base + 0x0A63F0u))((void *)entity, NULL,
+                                          "KoureniAutoPotahnuti.i3d", 1, 0);
+    }
+}
+
+static int BindEnemyInstanceAi(uintptr_t entity)
+{
+    void **original = *(void ***)entity;
+    if (!g_originalEntityTick || original[13] != (void *)g_originalEntityTick)
+        return 0;
+    memcpy(g_enemyVtable, original, sizeof(g_enemyVtable));
+    g_enemyVtable[13] = (void *)TutorialEnemyTick;
+    *(void ***)entity = g_enemyVtable;
+    return 1;
+}
+
+static HostObjectFn g_pedestrianPanic;
+static HostFlagFn g_pedestrianMegaPanic;
+
+static void __fastcall TutorialPedestrianPanic(void *pedestrian, void *unused, int severity)
+{
+    (void)unused;
+    if (g_tutorialFreeride)
+        g_pedestrianPanic(pedestrian, NULL);
+    else
+        g_pedestrianMegaPanic(pedestrian, NULL, severity);
+}
+
+static void InstallPedestrianPanicHook(void)
+{
+    static const BYTE signatures[2][5] = {
+        {0xE8, 0x2F, 0x5C, 0x00, 0x00},
+        {0xE8, 0xBA, 0x3A, 0x00, 0x00}
+    };
+    static const uintptr_t sites[2] = {0x0B837Cu, 0x0BA4F1u};
+    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    int index;
+    for (index = 0; index < 2; ++index)
+        if (memcmp((const void *)(base + sites[index]), signatures[index], 5) != 0)
+            return;
+    g_pedestrianPanic = (HostObjectFn)(base + 0x0BDE50u);
+    g_pedestrianMegaPanic = (HostFlagFn)(base + 0x0BDFB0u);
+    for (index = 0; index < 2; ++index)
+    {
+        BYTE *site = (BYTE *)(base + sites[index]);
+        DWORD protection, restored;
+        int32_t displacement;
+        if (!VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &protection))
+            return;
+        displacement = (int32_t)((uintptr_t)TutorialPedestrianPanic - (uintptr_t)(site + 5));
+        memcpy(site + 1, &displacement, sizeof(displacement));
+        VirtualProtect(site, 5, protection, &restored);
+        FlushInstructionCache(GetCurrentProcess(), site, 5);
+    }
+    Log("Tutorial crowd panic: ordinary fleeing instead of collapse");
+}
+
+static void __cdecl TutorialGameLoop(void)
+{
+    if (g_tutorialFreeride && g_originalEntityTick)
+    {
+        __try
+        {
+            SpawnTutorialEnemy();
+            if (g_tutorialEnemy && !BindEnemyInstanceAi(g_tutorialEnemy))
+                Log("Enemy instance AI binding rejected");
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            Log("Enemy spawn exception 0x%08lX", GetExceptionCode());
+        }
+    }
+    g_gameLoop();
+    if (g_tutorialCigarette)
+        ((HostFrameReleaseFn)HostVirtual(g_tutorialCigarette, 0))((void *)g_tutorialCigarette);
+    g_tutorialCigarette = 0;
+    g_tutorialEnemy = 0;
+    g_tutorialFreeride = 0;
+}
+
+static void InstallTutorialHook(void)
+{
+    static const BYTE actionSignature[] = {0xB8, 0x11, 0x00, 0x00, 0x00};
+    static const BYTE storeSignature[] = {
+        0x8B, 0x44, 0x24, 0x04, 0x8B, 0x4C, 0x24, 0x08,
+        0x8B, 0x54, 0x24, 0x0C, 0xA3, 0xD0, 0x1E, 0x67, 0x00
+    };
+    static const BYTE policeCall[] = {0xE8, 0xE2, 0xC7, 0x00, 0x00};
+    static const BYTE loopCall[] = {0xE8, 0x67, 0xF5, 0xFF, 0xFF};
+    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    BYTE *action = (BYTE *)(base + 0x176AA7u);
+    BYTE *store = (BYTE *)(base + 0x1608F0u);
+    struct { BYTE *address; uintptr_t callback; } patches[3];
+    DWORD protection, restored;
+    int32_t displacement;
+    int index;
+    if (memcmp(action, actionSignature, sizeof(actionSignature)) != 0 ||
+        memcmp(store, storeSignature, sizeof(storeSignature)) != 0 ||
+        memcmp((const void *)(base + 0x1C01F9u), policeCall, sizeof(policeCall)) != 0 ||
+        memcmp((const void *)(base + 0x1F9FD4u), loopCall, sizeof(loopCall)) != 0 ||
+        *(const DWORD *)(base + 0x1FA260u) != base + 0x1F9C8Au ||
+        memcmp((const void *)(base + 0x251338u), "tutorial", 9) != 0 ||
+        memcmp((const void *)(base + 0x2512CCu), "freeitaly", 10) != 0 ||
+        *(const DWORD *)(base + 0x1FA28Cu) != base + 0x1F9D7Au)
+    {
+        Log("tutorial redirect disabled: Mafia 1.0 signatures did not match");
+        return;
+    }
+    g_freerideStore = (FreerideStoreFn)store;
+    g_policeState = (PoliceStateFn)(base + 0x1CC9E0u);
+    g_gameLoop = (GameLoopFn)(base + 0x1F9540u);
+    patches[0].address = (BYTE *)(base + 0x1C01F9u);
+    patches[0].callback = (uintptr_t)TutorialPoliceState;
+    patches[1].address = (BYTE *)(base + 0x1F9FD4u);
+    patches[1].callback = (uintptr_t)TutorialGameLoop;
+    patches[2].address = action;
+    patches[2].callback = (uintptr_t)TutorialFreerideAction;
+    for (index = 0; index < 3; ++index)
+    {
+        BYTE *address = patches[index].address;
+        if (!VirtualProtect(address, 5, PAGE_EXECUTE_READWRITE, &protection))
+            return;
+        displacement = (int32_t)(patches[index].callback - (uintptr_t)(address + 5));
+        address[0] = 0xE8;
+        memcpy(address + 1, &displacement, sizeof(displacement));
+        VirtualProtect(address, 5, protection, &restored);
+        FlushInstructionCache(GetCurrentProcess(), address, 5);
+    }
+    Log("Tutorial menu redirected to Little Italy freeride");
+}
+
 static DWORD WINAPI InstallThread(void *unused)
 {
     int attempt;
     (void)unused;
     InstallCrouchHook();
+    InstallTutorialHook();
+    InstallPedestrianPanicHook();
+    {
+        uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+        void **table = (void **)(base + 0x23B488u);
+        if (table[13] == (void *)(base + 0x012480u) &&
+            memcmp((const void *)(base + 0x1FED70u), "\x64\xA1\x00\x00\x00\x00", 6) == 0 &&
+            memcmp((const void *)(base + 0x0A63F0u), "\x56\x8B\xF1\x33\xC0", 5) == 0)
+        {
+            g_originalEntityTick = (HostEntityTickFn)table[13];
+            if (g_originalEntityTick)
+                Log("Mafioso AI bound; shared entity vtable unchanged");
+        }
+    }
     for (attempt = 0; attempt < 100; ++attempt)
     {
         int result = InstallHooks();

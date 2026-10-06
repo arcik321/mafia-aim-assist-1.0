@@ -1,0 +1,33 @@
+{
+  "name": "Mafia PC 1.0 verified local build",
+  "sha256": "9F3C6EE5C0C5629A076CD22FB777C0EA0B889F1BE3E093780A357A7025ED3DDA",
+  "machine": 332,
+  "imageBase": "0x00400000",
+  "reference": "https://github.com/st0rm94/mafia-reverse-engineering-export",
+  "symbols": [
+    { "name": "game_get_player_actor", "rva": "0x00025530", "bytes": "8B 81 E4 00 00 00 C3", "abi": "thiscall, returns actor pointer" },
+    { "name": "human_do_crouched", "rva": "0x0009FDF0", "bytes": "83 EC 18 56 8B F1 8B 86 F8 06 00 00 85 C0", "abi": "thiscall(bool), ret 4" },
+    { "name": "player_crouch_call", "rva": "0x000C9183", "bytes": "E8 68 6C FD FF", "abi": "on-foot player callsite" },
+    { "name": "tutorial_menu_result", "rva": "0x00176AA7", "bytes": "B8 11 00 00 00", "abi": "original Tutorial result 0x11" },
+    { "name": "freeride_store", "rva": "0x001608F0", "bytes": "8B 44 24 04 8B 4C 24 08 8B 54 24 0C A3 D0 1E 67 00", "abi": "stdcall(int,int,float,float,float), ret 0x14" },
+    { "name": "police_script_call", "rva": "0x001C01F9", "bytes": "E8 E2 C7 00 00", "abi": "thiscall(bool,int,int), ret 0x0C" },
+    { "name": "session_loop_call", "rva": "0x001F9FD4", "bytes": "E8 67 F5 FF FF", "abi": "cdecl, game loop callsite" },
+    { "name": "mission_create_actor", "rva": "0x001FED70", "bytes": "64 A1 00 00 00 00", "abi": "thiscall(int), returns actor" },
+    { "name": "game_add_temporary_actor", "rva": "0x001E3220", "bytes": "51 53 55 56 57 8B F9 8B", "abi": "thiscall(actor), invokes GameInit" },
+    { "name": "entity_ai", "rva": "0x00012480", "bytes": "83 EC 58 53 55 56 8B F1", "abi": "thiscall(uint milliseconds), vtable slot 13" },
+    { "name": "entity_shared_ai_slot", "rva": "0x0023B4BC", "bytes": "80 24 41 00", "abi": "read only; use an instance vtable for custom NPC AI" },
+    { "name": "human_play_animation", "rva": "0x000A63F0", "bytes": "56 8B F1 33 C0 57 C7 86", "abi": "thiscall(name,bool,bool), ret 0x0C" },
+    { "name": "sensors_can_see", "rva": "0x000101B0", "bytes": "8B 44 24 04 56 50 8B F1", "abi": "thiscall(actor), BYTE bool in AL; receiver entity+0xBB4" },
+    { "name": "state_switcher_suspend", "rva": "0x001C9010", "bytes": "8A 44 24 04 84 C0 8B 81", "abi": "thiscall(bool); receiver entity" },
+    { "name": "los_wrapper", "rva": "0x00190A30", "bytes": "E9 6B 2E FF FF", "abi": "thiscall with six stack args; receiver Game+0x27A588; ret 0x18" },
+    { "name": "pedestrian_ordinary_panic", "rva": "0x000BDE50", "bytes": "83 EC 24 56 8B F1 57 8B", "abi": "thiscall(), receiver C_traffic_element" },
+    { "name": "pedestrian_mega_panic", "rva": "0x000BDFB0", "bytes": "56 8B F1 80 3E 00 0F 85", "abi": "thiscall(severity), ret 4" },
+    { "name": "pedestrian_panic_call_a", "rva": "0x000B837C", "bytes": "E8 2F 5C 00 00", "abi": "ambient update panic callsite, not Hit" },
+    { "name": "pedestrian_panic_call_b", "rva": "0x000BA4F1", "bytes": "E8 BA 3A 00 00", "abi": "ambient update panic callsite, not Hit" },
+    { "name": "npc_morale", "rva": "0x00032500", "bytes": "8B 41 24 D9 80 7C 06 00", "abi": "thiscall(), float in ST0, receiver entity+0xEBC" },
+    { "name": "npc_intelligence", "rva": "0x00032510", "bytes": "8B 41 24 D9 80 64 06 00", "abi": "thiscall(), float in ST0, receiver entity+0xEBC" },
+    { "name": "npc_aggression", "rva": "0x00032520", "bytes": "8B 41 24 D9 80 60 06 00", "abi": "thiscall(), float in ST0, receiver entity+0xEBC" },
+    { "name": "npc_sight", "rva": "0x00032530", "bytes": "8B 41 24 D9 80 6C 06 00", "abi": "thiscall(), float in ST0, receiver entity+0xEBC" },
+    { "name": "npc_hearing", "rva": "0x00032540", "bytes": "8B 41 24 D9 80 70 06 00", "abi": "thiscall(), float in ST0, receiver entity+0xEBC" }
+  ]
+}

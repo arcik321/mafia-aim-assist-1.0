@@ -482,15 +482,35 @@ static void GetAimPointPosition(uintptr_t target, Vector3 origin, Vector3 *aimPo
 
 static int ListBounds(uintptr_t world, uintptr_t *begin, uintptr_t *count)
 {
-    uintptr_t b = ReadU32(world + WORLD_LIST_BEGIN_OFFSET);
-    uintptr_t e = ReadU32(world + WORLD_LIST_END_OFFSET);
-    if (b < 0x10000u || e < b || ((e - b) & 3u))
-        return 0;
-    *count = (e - b) / 4u;
-    if (*count == 0 || *count > MAX_ENTITIES || !IsReadable((const void *)b, *count * 4u))
-        return 0;
-    *begin = b;
-    return 1;
+    static uintptr_t actors[MAX_ENTITIES * 2u];
+    uintptr_t game = ReadU32(world + MISSION_GAME_OFFSET);
+    uintptr_t headers[2] = {world + WORLD_LIST_BEGIN_OFFSET, game ? game + 0x124u : 0};
+    uintptr_t list, total = 0;
+    for (list = 0; list < 2u; ++list)
+    {
+        uintptr_t first = ReadU32(headers[list]);
+        uintptr_t end = ReadU32(headers[list] + 4u);
+        uintptr_t length, index;
+        if (first < 0x10000u || end < first || ((end - first) & 3u))
+            continue;
+        length = (end - first) / 4u;
+        if (length > MAX_ENTITIES || !length || !IsReadable((const void *)first, length * 4u))
+            continue;
+        for (index = 0; index < length; ++index)
+        {
+            uintptr_t actor = ReadU32(first + index * 4u);
+            uintptr_t existing;
+            if (!actor)
+                continue;
+            for (existing = 0; existing < total && actors[existing] != actor; ++existing)
+                ;
+            if (existing == total)
+                actors[total++] = actor;
+        }
+    }
+    *begin = (uintptr_t)actors;
+    *count = total;
+    return total != 0;
 }
 
 static int TargetStillValid(uintptr_t world, uintptr_t player, uintptr_t target, Vector3 *position)

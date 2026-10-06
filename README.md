@@ -10,6 +10,33 @@ controller through Steam Input, on a laptop or on a handheld.
 - Single-player only. No game files are modified or distributed; the mod adds a few DLLs next to `Game.exe`.
 - Hot-reloadable logic, tiny and dependency free (no Visual C++ runtime needed).
 
+## Tutorial Shortcut
+
+The main-menu **Tutorial** button launches the game's native **Little Italy Free Ride** (`freeitaly`) instead
+of the training sequence. Standard traffic is retained, police traffic is set to zero, and scripted police-manager
+activation is suppressed for that session. The override ends when the game loop returns to the menu; ordinary
+story and Free Ride sessions retain their native police behavior.
+
+This is a host-DLL change, so restart the game after installing it. Mission files and the game executable on disk
+are not modified. Aim assist and the Xbox B crouch toggle remain available.
+
+This session also creates one hostile mafioso using the `SamHIGH` model, six metres ahead of the player's starting
+position and facing away. He plays the game's cigarette-smoking animations, with the cigarette model attached
+to his right-hand attachment. Automatic AI state changes are held until the player is in front and the game's
+visual-contact system confirms he is seen. The cigarette is then hidden and native combat AI takes over.
+The NPC is a temporary actor owned by the game and is removed with the session.
+
+Aim target collection includes both placed and temporary actors. Ambient gunfire-collapse panic is replaced
+with ordinary fleeing only in this tutorial sandbox; native injury/death and other game modes are unchanged.
+Custom AI is attached to the spawned NPC instance, not the shared class vtable.
+
+## Development Notes
+
+See [docs/MODDING.md](docs/MODDING.md) for verified engine facts, NPC personality parameters, ABI lessons and
+the next steps for safe event-driven spawning. [config/mafia-1.0.profile.json](config/mafia-1.0.profile.json) records
+binary signatures and calling conventions. Validate the supported disk EXE with
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/check-game.ps1`.
+
 ## Install
 
 1. Download the latest `MafiaAimAssist-x.y.z.zip` from the Releases page and extract it.
@@ -143,11 +170,15 @@ PC export in [mafia-reverse-engineering-export](https://github.com/st0rm94/mafia
 | LOS | `0x190A30`, `thiscall`, collision object `0x27A588`, six stack arguments, `ret 0x18` |
 | Crouch | `0x09FDF0`, `thiscall`, one boolean stack argument, `ret 4` |
 | Player crouch call | `0x0C9183`, original bytes `E8 68 6C FD FF`; only this on-foot call is redirected |
+| Tutorial menu result | `0x176AA7`, `B8 11 00 00 00`; action `0x11` resolves to the `tutorial` scene and is redirected to native FreeItaly action `0x1C` |
+| Free Ride configuration | `0x1608F0`; five stack arguments, `ret 0x14`; default model/flags/traffic with police ratio zero |
+| Script police activation | `0x1C01F9`, call to `0x1CC9E0`; three stack arguments; activation forced off only during tutorial-launched Free Ride |
+| Session end | `0x1F9FD4`, call to `0x1F9540`; clears the tutorial-specific override when the normal game loop returns |
 
 The stable host owns the crouch hook. Reloadable logic only chooses the boolean passed to the original game
 method; it does not write the stance byte or invoke that method from the mouse callback.
 The native x86 regression harness uses simulated world memory and an ABI-compatible setter, not the game's
-animation/collision engine. Run it with `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/cleanbuild.ps1 -Test`.
+animation/collision engine or a full mission launch. Run it with `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/cleanbuild.ps1 -Test`.
 
 ## Known limitations
 
