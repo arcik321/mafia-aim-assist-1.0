@@ -337,6 +337,15 @@ static int GetWorld(uintptr_t *world, uintptr_t *player)
         ReadU32(*player + 0x98u) == 0 && ReadU32(*player + 0x9Cu) == 0;
 }
 
+static int DriveBySearchSector(Vector3 origin, Vector3 forward, Vector3 target)
+{
+    Vector3 direction = Subtract(target, origin);
+    forward.y = direction.y = 0.0f;
+    if (!Normalize(&forward) || !Normalize(&direction))
+        return 0;
+    return direction.z * forward.x - direction.x * forward.z >= 0.0f;
+}
+
 static int DriveByReachable(Vector3 origin, Vector3 forward, Vector3 target)
 {
     Vector3 direction = Subtract(target, origin);
@@ -553,11 +562,10 @@ static int DriveByCandidate(DriveByView *view, Vector3 point, float margin,
     float alignment;
     int nearbyOfficer = footOfficer && Dot(fromWeapon, fromWeapon) <= 64.0f;
     if (distanceSquared < 0.0625f || distanceSquared > MAX_TARGET_DISTANCE * MAX_TARGET_DISTANCE ||
+        !DriveBySearchSector(view->origin, view->forward, point) ||
         !DriveByReachable(view->origin, view->forward, point) || !Normalize(&direction))
         return 0;
     alignment = Dot(direction, view->aimDirection);
-    if (!nearbyOfficer && alignment < 0.9397f)
-        return 0;
     if (!DriveByLineClear(view->origin, point, margin) ||
         (!nearbyOfficer && !DriveByLineClear(view->cameraPosition, point, margin)))
         return 0;

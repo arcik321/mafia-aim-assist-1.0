@@ -149,9 +149,10 @@ quiet guard and allied bodyguard. Combine personality, senses, weapon/accuracy/h
 on-foot-only for B crouch (B can therefore be the brake). No shot/AI/physics setter is called by this feature.
 The target order is police wheels, scripted foot cops (group2), then ambient cops (categories1/3), choosing
 the best geometrically reachable officer across both officer pools. Civilians and seated actors are excluded.
-Only targets in the driver-left 40..140 degree sector, elevation -30..25 degrees and range80m qualify.
-Wheels and distant officers use camera cone20 degrees. Nearby foot officers (weapon distance<=8m) use the
-full reachable left sector so standing at the door does not require already pointing the camera at them.
+Search uses the full driver-left180 degree half-plane, including its front/rear edges, relative to the car.
+Lock eligibility remains a SEPARATE conservative40..140 degree left/elevation-30..25/range80m filter; the
+180 degree search does not establish the native animation's full firing limits. No camera cone is required
+for wheels or officers; camera alignment only ranks valid candidates. The right half-plane remains excluded.
 The view and firing line are checked on every correction, with no on-foot LOS grace period.
 
 RE and local binary getter evidence: wheel count C_car+5B0, pointer array+D24; wheel world hub+1C,
@@ -167,7 +168,8 @@ Their endpoint tolerance is0.35m to avoid mistaking the target's body capsule fo
 Officer aim height is1.25m (upper torso); minimum ray distance0.25m admits officers directly at the driver's door.
 Wheels and distant officers retain both rays. Failed collision binding/invalid frame fails closed even if ordinary
 LOS is disabled in the INI. Tests cover both officer pools, body-surface hits, camera blocked/gun clear,
-gun blocked, distant cone retention and right-side rejection. This does not disable native carjack/arrest AI.
+gun blocked, wide wheel/distant-officer acquisition, independent search/lock limits and right-side rejection.
+This does not disable native carjack/arrest AI.
 Wheel line tolerance uses its radius+0.02; this is a geometric approximation, not an identified hit-mesh guarantee.
 Spread, motion, stale engine poses and input timing mean this feature cannot promise every bullet hits a tyre.
 Drive-by gains are separate from the persisted foot calibration; driver motion does not train foot sensitivity.

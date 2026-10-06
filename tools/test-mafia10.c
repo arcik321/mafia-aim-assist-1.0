@@ -223,6 +223,15 @@ int main(void)
     Check(GetWorld(&worldAddress, &playerAddress) && worldAddress == (uintptr_t)mission &&
           playerAddress == (uintptr_t)player, "1.0 mission and player pointer chain");
     Check(ReadCamera(&position, &forward) && forward.z == 1.0f, "1.0 camera read");
+        Check(DriveBySearchSector((Vector3){0, 1, 0}, (Vector3){0, 0, 1}, (Vector3){-1, 0.5f, 10}) &&
+            DriveBySearchSector((Vector3){0, 1, 0}, (Vector3){0, 0, 1}, (Vector3){-1, 0.5f, -10}),
+            "180-degree search includes targets at both edges of the left half-plane");
+        Check(!DriveBySearchSector((Vector3){0, 1, 0}, (Vector3){0, 0, 1}, (Vector3){1, 0.5f, 10}) &&
+            !DriveBySearchSector((Vector3){0, 1, 0}, (Vector3){0, 0, 1}, (Vector3){1, 0.5f, -10}),
+            "180-degree search never includes the right half-plane");
+        Check(DriveBySearchSector((Vector3){0, 1, 0}, (Vector3){0, 0, 1}, (Vector3){-1, 0.5f, 10}) &&
+            !DriveByReachable((Vector3){0, 1, 0}, (Vector3){0, 0, 1}, (Vector3){-1, 0.5f, 10}),
+            "finding a target inside the search sector does not imply a reachable lock");
         Check(DriveByReachable((Vector3){0, 1, 0}, (Vector3){0, 0, 1}, (Vector3){-10, 0.5f, 0}),
             "driver can acquire a wheel on the left");
         Check(!DriveByReachable((Vector3){0, 1, 0}, (Vector3){0, 0, 1}, (Vector3){10, 0.5f, 0}),
@@ -340,6 +349,10 @@ int main(void)
           Check(FindDriveByTarget((uintptr_t)mission, (uintptr_t)player, &view, &selected) &&
               selected.owner == (uintptr_t)policeCar && selected.kind == 1,
               "reachable police wheel takes priority over nearer foot officer");
+            view.aimDirection = (Vector3){0, 0, 1};
+            Check(FindDriveByTarget((uintptr_t)mission, (uintptr_t)player, &view, &selected) && selected.kind == 1,
+                "reachable police wheel is acquired outside the old 20-degree camera cone");
+            view.aimDirection = (Vector3){-1, 0, 0};
           *(Vector3 *)(wheel + WHEEL_HUB_OFFSET) = (Vector3){10, 0.5f, 0};
           Check(FindDriveByTarget((uintptr_t)mission, (uintptr_t)player, &view, &selected) && selected.kind == 2,
               "right-hand police wheel is rejected and eligible left officer is selected");
@@ -413,8 +426,8 @@ int main(void)
             Check(!FindDriveByTarget((uintptr_t)mission, (uintptr_t)player, &view, &selected),
                 "near officer acquisition never bypasses driver's right-side exclusion");
             *(Vector3 *)(npc + ENTITY_POSITION_OFFSET) = (Vector3){-12, 0, 0};
-            Check(!FindDriveByTarget((uintptr_t)mission, (uintptr_t)player, &view, &selected),
-                "distant foot officer still requires the ordinary acquisition cone");
+                Check(FindDriveByTarget((uintptr_t)mission, (uintptr_t)player, &view, &selected) && selected.kind == 2,
+                    "reachable distant foot officer is acquired outside the old camera cone");
             *(Vector3 *)(npc + ENTITY_POSITION_OFFSET) = (Vector3){-5, 0, 0};
             view.aimDirection = (Vector3){-1, 0, 0};
           *(uint32_t *)(npc + ENTITY_TYPE_GROUP_OFFSET) = MISSION_ENEMY_GROUP;

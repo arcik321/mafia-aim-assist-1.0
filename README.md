@@ -14,9 +14,10 @@ controller through Steam Input, on a laptop or on a handheld.
 
 Hold LT (or the configured aim key) while firing from the driver seat. Lock-on prefers police-car wheels,
 then foot police, including ambient patrol officers. It excludes civilian cars, your own car and seated officers.
-Targets must be inside a conservative driver-left sector: 40 to 140 degrees left of the car heading,
-with elevation between -30 and +25 degrees. Wheels and distant officers require the 20-degree camera cone;
-foot officers within 8 metres of the weapon can be acquired across the full reachable left sector.
+Search covers the full 180-degree left half-plane relative to the car, independently of camera direction.
+Finding a target does not grant a lock: the conservative reachable-shot filter still requires 40 to 140 degrees
+left of the car heading and elevation between -30 and +25 degrees. The former 20-degree camera acquisition
+cone is removed for wheels and foot officers; camera alignment only ranks eligible targets.
 Foot officers use an upper-torso aim point (1.25 metres above their origin), including targets at the driver's door.
 The weapon-frame firing line must always be clear. Nearby officers do not require a clear chase-camera line,
 which can be obscured by your own car; wheels and distant officers retain that additional check.
