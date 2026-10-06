@@ -10,7 +10,31 @@ controller through Steam Input, on a laptop or on a handheld.
 - Single-player only. No game files are modified or distributed; the mod adds a few DLLs next to `Game.exe`.
 - Hot-reloadable logic, tiny and dependency free (no Visual C++ runtime needed).
 
-## Tutorial Shortcut
+## Drive-By Aim
+
+Hold LT (or the configured aim key) while firing from the driver seat. Lock-on prefers police-car wheels,
+then foot police, including ambient patrol officers. It excludes civilian cars, your own car and seated officers.
+Targets must be inside a conservative driver-left sector: 40 to 140 degrees left of the car heading,
+with elevation between -30 and +25 degrees. Wheels and distant officers require the 20-degree camera cone;
+foot officers within 8 metres of the weapon can be acquired across the full reachable left sector.
+Foot officers use an upper-torso aim point (1.25 metres above their origin), including targets at the driver's door.
+The weapon-frame firing line must always be clear. Nearby officers do not require a clear chase-camera line,
+which can be obscured by your own car; wheels and distant officers retain that additional check.
+Officer LOS tolerates the body surface up to 0.35 metres before the chest aim point. A blocked/right-side target is dropped
+immediately, even with `require_line_of_sight = 0`. This is geometric assistance, not a guarantee against
+weapon spread, target movement or input latency. Wheel terminal-state flags are skipped.
+
+In the game's driving controls, set accelerator to **A (Joy0 Button 1)** and brake/reverse to
+**B (Joy0 Button 2)**, removing LT/RT from both primary and secondary pedal bindings.
+Keep **RT (Joy0 Button 8)** for fire; the mod reads **LT** for lock-on. B crouch remains on-foot only.
+The right stick remains manual aiming control in the car; on-foot target/stature flicks do not run on car targets.
+Passenger seats are not supported by this driver-left implementation. Disable with `vehicle_aim = 0`.
+
+## Experimental Sandbox
+
+The old sandbox is disabled by default (`[sandbox] enabled = 0`): Tutorial, police and NPC behavior stay native.
+The following describes the optional previous experiment, not the drive-by implementation. Its reported
+explosion/NPC/crash regressions are unresolved; leave it disabled while testing ordinary missions or Free Ride.
 
 The main-menu **Tutorial** button launches the game's native **Little Italy Free Ride** (`freeitaly`) instead
 of the training sequence. Standard traffic is retained, police traffic is set to zero, and scripted police-manager
@@ -23,11 +47,14 @@ are not modified. Aim assist and the Xbox B crouch toggle remain available.
 This session also creates one hostile mafioso using the `SamHIGH` model, six metres ahead of the player's starting
 position and facing away. He plays the game's cigarette-smoking animations, with the cigarette model attached
 to his right-hand attachment. Automatic AI state changes are held until the player is in front and the game's
-visual-contact system confirms he is seen. The cigarette is then hidden and native combat AI takes over.
+visual-contact system confirms he is seen, or the mafioso takes nonfatal damage (including from behind).
+He has high aggression and morale to favor retaliation over fear. The cigarette is then hidden and the native
+state switcher resumes, choosing its own valid target instead of forcing combat with an empty target slot.
 The NPC is a temporary actor owned by the game and is removed with the session.
 
-Aim target collection includes both placed and temporary actors. Ambient gunfire-collapse panic is replaced
-with ordinary fleeing only in this tutorial sandbox; native injury/death and other game modes are unchanged.
+Aim target collection includes both placed and temporary actors. The two ambient gunfire-collapse calls are
+skipped only in this tutorial sandbox, without forcing another crowd state; native injury/death and other modes
+are unchanged. This does not cancel actual hit reactions or revive pedestrians.
 Custom AI is attached to the spawned NPC instance, not the shared class vtable.
 
 ## Development Notes
@@ -128,6 +155,7 @@ logs listed under [Troubleshooting](#troubleshooting).
 | `experimental_crouch_head_aim` | `1` | Fallback only: lower the height-based head point when the target's `+0x1e4` byte is nonzero. |
 | `aim_key` | `O` | Keyboard key for lock-on. Set one letter/digit, `F1`-`F12`, `SPACE`, `ENTER`, `TAB`, `ESC`, `SHIFT`, `CTRL`, `ALT`, `CAPSLOCK` or `BACKSPACE`. The left trigger remains enabled. |
 | `crouch_toggle` | `1` | Toggle crouch with Xbox B while on foot, through the game's normal player update. The 1.0 callsite and setter signatures are validated before hooking. Set `0` to disable. |
+| `vehicle_aim` | `1` | Driver-left police wheel/foot-officer lock-on; mandatory firing-line checks. Passenger seats are excluded. |
 | `aim_response_percent` | `70` | Lock-on strength. Lower it for a slower approach; accepted range is `25` to `150`. Changes are read while the game runs. |
 | `require_line_of_sight` | `1` | Require an unobstructed collision line to acquire or keep a target. Set `0` to disable. If the supported game function cannot be validated, the mod logs the issue and falls back to the previous targeting behavior. |
 | `prioritize_enemies` | `1` | Prefer scripted mission enemies (AI group 4) when acquiring or manually switching. A locked target is not automatically replaced. Falls back to another eligible person if no group-4 target is available; set `0` to disable. |
@@ -142,7 +170,8 @@ logs listed under [Troubleshooting](#troubleshooting).
 ## Troubleshooting
 
 - **Nothing happens when holding the trigger:** check that the Aim control is `Mouse - Y axis` / `Mouse - X axis`
-  and that a person is within about 80 metres in front of you. Aim assist is off while driving.
+  and that a person is within about 80 metres in front of you. Drive-by lock requires a firearm, the driver seat
+  and a reachable police target on the left.
 - **The controller does nothing at all:** connect it before launching, enable Steam Input with the Gamepad layout,
   and confirm the Xidi files are installed. Without Steam Input, Windows exposes the controller to the game directly.
 - **Camera spins or aim drifts the wrong way:** delete `%TEMP%\MafiaAimGain.cal` and try again; the mod relearns
@@ -186,7 +215,7 @@ animation/collision engine or a full mission launch. Run it with `powershell.exe
   the search area, the mod falls back to another living pedestrian, which may be a civilian.
 - Line-of-sight filtering uses the supported Game.exe 1.0 collision query. If its wrapper signature does not match,
   filtering is disabled and the previous targeting behavior is retained.
-- Disabled while driving.
+- Drive-by support is driver-seat only and conservatively filters shot geometry; full in-game verification is pending.
 - It replaces `dinput8.dll`, so it cannot be combined with other mods that use the same file name.
 
 ## How it works

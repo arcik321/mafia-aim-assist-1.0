@@ -14,8 +14,10 @@ Evidence labels for future additions:
 - Runtime: observed in the running game. Record model, mission and relevant log.
 
 The user confirmed aim, Xbox B toggle, Little Italy tutorial launch and cigarette animation.
-Temporary-target acquisition and tutorial crowd fleeing have regression coverage; their latest build still needs
-in-game confirmation. Earlier tests missed temporary actor registration and misidentified the Tutorial action.
+Temporary-target acquisition has runtime aim-correction logs. The user subsequently reported crowd collapse,
+frozen/unkillable ambient gangsters and a fleeing custom mafioso in the previous build. The revised panic and
+damage-alert paths have harness coverage, but their visible behavior still needs confirmation in a fresh session.
+Earlier tests missed temporary actor registration and misidentified the Tutorial action.
 
 ## Supported Build And Tools
 
@@ -75,7 +77,9 @@ Police traffic ratio is zero; scripted police activation is suppressed only duri
 The session flag is cleared after the native game loop returns. Other story/Free Ride sessions keep native police.
 
 Gunfire can trigger native pedestrian mega-panic/collapse. This is not proof that everyone died.
-Only the two mega-panic calls in the ambient update are redirected to ordinary fleeing in this sandbox.
+Only the two mega-panic calls in the ambient update are skipped in this sandbox. Do not substitute SetPanic
+at those sites: it has separate path/witness/latch guards and is not an equivalent state transition.
+The regression harness invokes both patched native caller layouts to exercise ECX, stack arguments and cleanup.
 The Hit dispatcher is untouched; actual injury/death behavior is not replaced or resurrected.
 
 ## NPC Creation And State
@@ -94,9 +98,15 @@ Animations KoureniAutoStativ.i3d and KoureniAutoPotahnuti.i3d are verified from 
 The 2cigaro.i3d model is linked at the right-hand weapon attachment +0x570 and hidden on combat transition.
 
 Before combat, suspend the native state switcher, but keep visual contacts refreshed via ai_vis_logs_tick.
-Combat requires the player in front AND native ai_sensors_can_see(entity+0xBB4, player).
-Do not substitute sound/smell contact for a visual-only alert. Once alerted, stop smoking, release the switcher
-and let native combat AI run. Aggression is not the same as faction or visibility.
+The initial visual alert requires the player in front AND native ai_sensors_can_see(entity+0xBB4, player).
+Nonfatal health loss also ends smoking regardless of facing, including after an earlier alert. This is a damage
+signal, not verified attacker identification; other damage sources also wake him. Sound alone does not wake him.
+The custom enemy alone has effective aggression=1 and morale=1; morale dampens the native fear score.
+Once alerted, stop smoking and release the switcher. Do NOT force state3 with an empty angry target (+0x1280):
+the suspended selector has not populated it. Let native perception/logs/state selection initialize combat.
+No health, death flags, global actor state or other NPC personality is reset by this path.
+Aggression is not the same as faction or visibility. The actual instance-vtable callback, native stop/suspend
+ABIs, forwarding for unrelated actors and fatal-damage behavior are exercised by the x86 harness.
 
 Future spawn APIs must handle ground placement, collision clearance, model/init failure rollback, ownership,
 dead/despawned actor handles, cooldowns and session reset. Current placement is relative to player origin;
@@ -132,6 +142,37 @@ Proposed presets (not implemented or calibrated yet): nervous lookout, aggressiv
 quiet guard and allied bodyguard. Combine personality, senses, weapon/accuracy/health, faction and an idle script.
 
 ## Dynamic Features Next
+
+### Driver Police Aim
+
+`vehicle_aim=1` enables driver-seat-only LT/O lock-on. GetActiveWorld permits cars, while GetWorld remains
+on-foot-only for B crouch (B can therefore be the brake). No shot/AI/physics setter is called by this feature.
+The target order is police wheels, scripted foot cops (group2), then ambient cops (categories1/3), choosing
+the best geometrically reachable officer across both officer pools. Civilians and seated actors are excluded.
+Only targets in the driver-left 40..140 degree sector, elevation -30..25 degrees and range80m qualify.
+Wheels and distant officers use camera cone20 degrees. Nearby foot officers (weapon distance<=8m) use the
+full reachable left sector so standing at the door does not require already pointing the camera at them.
+The view and firing line are checked on every correction, with no on-foot LOS grace period.
+
+RE and local binary getter evidence: wheel count C_car+5B0, pointer array+D24; wheel world hub+1C,
+radius+10C, flags+120. Skip terminal flag40000000 without claiming that every punctured tyre has that flag.
+Police-car flag C_car+2044 is used rather than model names. Ambient vector globals RVA2560C4/2560C8,
+record stride200, active+C, position+10, category+15A. These records are never cast to C_human.
+
+Native driver code VA4C9C8F and4CA326 reads mission+10 scene, scene+17C active camera, camera+30 direction
+and+40 position. Use that camera for angular correction: human+200 is only latched while shooting and is NOT
+a live look direction. Weapon frame human+564 supplies firing clearance. The weapon line must always be clear;
+only nearby officers omit the chase-camera ray, which can intersect the player's own car while the gun is clear.
+Their endpoint tolerance is0.35m to avoid mistaking the target's body capsule for cover before its chest point.
+Officer aim height is1.25m (upper torso); minimum ray distance0.25m admits officers directly at the driver's door.
+Wheels and distant officers retain both rays. Failed collision binding/invalid frame fails closed even if ordinary
+LOS is disabled in the INI. Tests cover both officer pools, body-surface hits, camera blocked/gun clear,
+gun blocked, distant cone retention and right-side rejection. This does not disable native carjack/arrest AI.
+Wheel line tolerance uses its radius+0.02; this is a geometric approximation, not an identified hit-mesh guarantee.
+Spread, motion, stale engine poses and input timing mean this feature cannot promise every bullet hits a tyre.
+Drive-by gains are separate from the persisted foot calibration; driver motion does not train foot sensitivity.
+In-game correction/framing still requires runtime confirmation. The experimental sandbox is now off by default
+(`[sandbox] enabled=0`), following the user's decision to abandon its unresolved explosion/crash investigation.
 
 - Button spawn: rising edge queues a typed spawn request; a main-thread update drains it after checking the world.
 - Ground-shot allies: observe the player's real shot and its collision hit, check downward direction and ground

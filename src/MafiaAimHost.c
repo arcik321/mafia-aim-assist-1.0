@@ -331,7 +331,6 @@ typedef void (__fastcall *HostFlagFn)(void *object, void *unused, int flag);
 typedef void (__fastcall *HostPositionFn)(void *frame, void *unused, const HostVector3 *position);
 typedef int (__fastcall *HostPlayAnimFn)(void *human, void *unused, const char *name, int loop, int simple);
 typedef unsigned char (__fastcall *HostCanSeeFn)(void *sensors, void *unused, void *actor);
-typedef void (__fastcall *HostForceAiFn)(void *entity, void *unused, int state, int, int, float);
 typedef int (__fastcall *HostInventoryFn)(void *inventory, void *unused, const DWORD *item, int select);
 typedef void *(__stdcall *HostCreateFrameFn)(void *driver, int kind);
 typedef void (__stdcall *HostFrameNameFn)(void *frame, const char *name);
@@ -341,10 +340,28 @@ typedef void (__stdcall *HostFrameOnFn)(void *frame, int enabled);
 typedef void (__stdcall *HostFrameReleaseFn)(void *frame);
 
 static HostEntityTickFn g_originalEntityTick;
-static void *g_enemyVtable[39];
+static struct {
+    void *prefix;
+    void *methods[39];
+} g_enemyVtable;
 static uintptr_t g_tutorialEnemy, g_tutorialCigarette;
 static int g_enemyAlerted;
 static DWORD g_enemyAnimElapsed;
+static float g_enemyHealth;
+
+static void ConfigureEnemyPersonality(uintptr_t entity)
+{
+    *(float *)(entity + 0x660u) = 1.0f;
+    *(float *)(entity + 0x67Cu) = 1.0f;
+    *(float *)(entity + 0xECCu) = 0.0f;
+    *(float *)(entity + 0xEC4u) = 0.0f;
+}
+
+static int EnemyWasHurt(float health, float previousHealth)
+{
+    return _finite(health) && _finite(previousHealth) &&
+           health > 0.01f && previousHealth > health;
+}
 
 static void *HostVirtual(uintptr_t object, unsigned int byteOffset)
 {
@@ -432,12 +449,14 @@ static void SpawnTutorialEnemy(void)
     }
     *(DWORD *)(entity + 0x5FCu) = 0x10;
     ((HostObjectArgFn)(base + 0x1E3220u))((void *)game, NULL, (void *)entity);
+    ConfigureEnemyPersonality(entity);
     ((HostInventoryFn)(base + 0x15B2D0u))((void *)(entity + 0x480u), NULL, weapon, 0);
     ((HostObjectFn)(base + 0x09F180u))((void *)entity, NULL);
     ((HostFlagFn)(base + 0x1C9010u))((void *)entity, NULL, 1);
     g_tutorialEnemy = entity;
     g_enemyAlerted = 0;
     g_enemyAnimElapsed = 0;
+    g_enemyHealth = *(float *)(entity + 0x644u);
     hand = *(uintptr_t *)(entity + 0x570u);
     if (hand)
     {
@@ -460,28 +479,34 @@ static void __fastcall TutorialEnemyTick(void *actor, void *unused, DWORD delta)
 {
     uintptr_t entity = (uintptr_t)actor;
     uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    float health;
+    int hurt;
     (void)unused;
     g_originalEntityTick(actor, NULL, delta);
-    if (!g_tutorialFreeride || entity != g_tutorialEnemy || g_enemyAlerted ||
-        *(float *)(entity + 0x644u) <= 0.01f)
+    if (!g_tutorialFreeride || entity != g_tutorialEnemy)
+        return;
+    health = *(float *)(entity + 0x644u);
+    hurt = EnemyWasHurt(health, g_enemyHealth);
+    g_enemyHealth = health;
+    if (!_finite(health) || health <= 0.01f || (g_enemyAlerted && !hurt))
         return;
     ((HostObjectFn)(base + 0x0107D0u))((void *)(entity + 0xB04u), NULL);
     {
         uintptr_t mission = *(uintptr_t *)(base + 0x25115Cu);
         uintptr_t game = *(uintptr_t *)(mission + 0x24u);
         uintptr_t player = *(uintptr_t *)(game + 0xE4u);
-        if (player && EnemyMayNotice(*(HostVector3 *)(entity + 0x24u),
+        if (player && (hurt || (EnemyMayNotice(*(HostVector3 *)(entity + 0x24u),
                                     *(HostVector3 *)(entity + 0x30u),
                                     *(HostVector3 *)(player + 0x24u)) &&
-            ((HostCanSeeFn)(base + 0x0101B0u))((void *)(entity + 0xBB4u), NULL, (void *)player))
+            ((HostCanSeeFn)(base + 0x0101B0u))((void *)(entity + 0xBB4u), NULL, (void *)player))))
         {
             g_enemyAlerted = 1;
             if (g_tutorialCigarette)
                 ((HostFrameOnFn)HostVirtual(g_tutorialCigarette, 0x24))((void *)g_tutorialCigarette, 0);
             ((HostObjectFn)(base + 0x09D840u))((void *)entity, NULL);
             ((HostFlagFn)(base + 0x1C9010u))((void *)entity, NULL, 0);
-            ((HostForceAiFn)(base + 0x02E650u))((void *)entity, NULL, 3, 0, 0, 1.0f);
-            Log("Mafioso saw the player: smoking stopped, combat AI enabled");
+            Log("Mafioso %s: smoking stopped, native target/state selection resumed",
+                hurt ? "was hurt" : "saw the player");
             return;
         }
     }
@@ -499,21 +524,19 @@ static int BindEnemyInstanceAi(uintptr_t entity)
     void **original = *(void ***)entity;
     if (!g_originalEntityTick || original[13] != (void *)g_originalEntityTick)
         return 0;
-    memcpy(g_enemyVtable, original, sizeof(g_enemyVtable));
-    g_enemyVtable[13] = (void *)TutorialEnemyTick;
-    *(void ***)entity = g_enemyVtable;
+    g_enemyVtable.prefix = original[-1];
+    memcpy(g_enemyVtable.methods, original, sizeof(g_enemyVtable.methods));
+    g_enemyVtable.methods[13] = (void *)TutorialEnemyTick;
+    *(void ***)entity = g_enemyVtable.methods;
     return 1;
 }
 
-static HostObjectFn g_pedestrianPanic;
 static HostFlagFn g_pedestrianMegaPanic;
 
 static void __fastcall TutorialPedestrianPanic(void *pedestrian, void *unused, int severity)
 {
     (void)unused;
-    if (g_tutorialFreeride)
-        g_pedestrianPanic(pedestrian, NULL);
-    else
+    if (!g_tutorialFreeride)
         g_pedestrianMegaPanic(pedestrian, NULL, severity);
 }
 
@@ -529,7 +552,6 @@ static void InstallPedestrianPanicHook(void)
     for (index = 0; index < 2; ++index)
         if (memcmp((const void *)(base + sites[index]), signatures[index], 5) != 0)
             return;
-    g_pedestrianPanic = (HostObjectFn)(base + 0x0BDE50u);
     g_pedestrianMegaPanic = (HostFlagFn)(base + 0x0BDFB0u);
     for (index = 0; index < 2; ++index)
     {
@@ -543,7 +565,7 @@ static void InstallPedestrianPanicHook(void)
         VirtualProtect(site, 5, protection, &restored);
         FlushInstructionCache(GetCurrentProcess(), site, 5);
     }
-    Log("Tutorial crowd panic: ordinary fleeing instead of collapse");
+    Log("Tutorial crowd: collapse gesture skipped; native movement and damage retained");
 }
 
 static void __cdecl TutorialGameLoop(void)
@@ -566,6 +588,7 @@ static void __cdecl TutorialGameLoop(void)
         ((HostFrameReleaseFn)HostVirtual(g_tutorialCigarette, 0))((void *)g_tutorialCigarette);
     g_tutorialCigarette = 0;
     g_tutorialEnemy = 0;
+    g_enemyHealth = 0.0f;
     g_tutorialFreeride = 0;
 }
 
@@ -620,13 +643,33 @@ static void InstallTutorialHook(void)
     Log("Tutorial menu redirected to Little Italy freeride");
 }
 
+static void InstallSandboxHooks(int enabled)
+{
+    if (!enabled)
+    {
+        Log("Experimental sandbox disabled: native Tutorial, police and NPCs retained");
+        return;
+    }
+    InstallTutorialHook();
+    InstallPedestrianPanicHook();
+}
+
 static DWORD WINAPI InstallThread(void *unused)
 {
     int attempt;
+    char iniPath[MAX_PATH];
+    DWORD length;
     (void)unused;
     InstallCrouchHook();
-    InstallTutorialHook();
-    InstallPedestrianPanicHook();
+    length = GetModuleFileNameA(NULL, iniPath, MAX_PATH);
+    if (length && length < MAX_PATH - 32)
+    {
+        while (length && iniPath[length - 1] != '\\' && iniPath[length - 1] != '/')
+            --length;
+        iniPath[length] = '\0';
+        lstrcatA(iniPath, "MafiaAimAssist.ini");
+        InstallSandboxHooks(GetPrivateProfileIntA("sandbox", "enabled", 0, iniPath) != 0);
+    }
     {
         uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
         void **table = (void **)(base + 0x23B488u);
