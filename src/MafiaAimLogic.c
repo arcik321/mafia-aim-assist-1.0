@@ -535,11 +535,24 @@ static int DriveByLineClear(Vector3 origin, Vector3 point, float targetMargin)
     return sqrtf(Dot(delta, delta)) + targetMargin >= distance;
 }
 
+static int TyreAimPoint(Vector3 hub, Vector3 up, float radius, Vector3 *point)
+{
+    float offset;
+    if (!IsFinite(radius) || radius < 0.1f || radius > 1.0f || !Normalize(&up))
+        return 0;
+    offset = radius * 0.85f;
+    point->x = hub.x + up.x * offset;
+    point->y = hub.y + up.y * offset;
+    point->z = hub.z + up.z * offset;
+    return IsFinite(point->x) && IsFinite(point->y) && IsFinite(point->z);
+}
+
 static int ReadPoliceWheel(uintptr_t car, uint32_t index, Vector3 *point, float *radius)
 {
     uint32_t count = ReadU32(car + CAR_WHEEL_COUNT_OFFSET);
     uintptr_t wheels = ReadU32(car + CAR_WHEELS_OFFSET);
     uintptr_t wheel;
+    Vector3 up;
     if (ReadU32(car + ENTITY_KIND_OFFSET) != CAR_KIND || ReadByte(car + CAR_POLICE_OFFSET) != 1 ||
         ReadByte(car + 0x5Eu) != 0 || !count || count > 8 || index >= count ||
         !IsReadable((void *)wheels, count * sizeof(uint32_t)))
@@ -550,7 +563,7 @@ static int ReadPoliceWheel(uintptr_t car, uint32_t index, Vector3 *point, float 
         !ReadVector(wheel + WHEEL_HUB_OFFSET, point))
         return 0;
     *radius = *(volatile float *)(wheel + 0x10Cu);
-    return IsFinite(*radius) && *radius >= 0.1f && *radius <= 1.0f;
+    return ReadVector(car + 0xD40u, &up) && TyreAimPoint(*point, up, *radius, point);
 }
 
 static int DriveByCandidate(DriveByView *view, Vector3 point, float margin,
@@ -667,12 +680,23 @@ static int ListBounds(uintptr_t world, uintptr_t *begin, uintptr_t *count)
     return total != 0;
 }
 
+static int IsStoppedCar(uintptr_t car)
+{
+    float speed;
+    if (!IsReadable((const void *)(car + 0x688u), sizeof(float)))
+        return 0;
+    speed = *(volatile float *)(car + 0x688u);
+    return IsFinite(speed) && fabsf(speed) <= 0.1f;
+}
+
 static int FindDriveByTarget(uintptr_t world, uintptr_t player, DriveByView *view,
                              DriveByTarget *result)
 {
     uintptr_t begin, count, index;
     float best = 1.0e20f;
     int found = 0;
+    int wheelFound;
+    DriveByTarget wheelTarget = {0};
     if (!ListBounds(world, &begin, &count))
         return 0;
     for (index = 0; index < count; ++index)
@@ -689,7 +713,7 @@ static int FindDriveByTarget(uintptr_t world, uintptr_t player, DriveByView *vie
             Vector3 point;
             float score, radius;
             if (ReadPoliceWheel(car, wheel, &point, &radius) &&
-                DriveByCandidate(view, point, radius + 0.02f, 0, &score) && score < best)
+                DriveByCandidate(view, point, 0.12f, 0, &score) && score < best)
             {
                 *result = (DriveByTarget){car, 1, wheel, point};
                 best = score;
@@ -697,8 +721,13 @@ static int FindDriveByTarget(uintptr_t world, uintptr_t player, DriveByView *vie
             }
         }
     }
-    if (found)
+    if (found && !IsStoppedCar(view->car))
         return 1;
+    wheelFound = found;
+    if (wheelFound)
+        wheelTarget = *result;
+    found = 0;
+    best = 1.0e20f;
     for (index = 0; index < count; ++index)
     {
         uintptr_t actor = ReadU32(begin + index * 4u);
@@ -706,7 +735,8 @@ static int FindDriveByTarget(uintptr_t world, uintptr_t player, DriveByView *vie
         float score;
         if (actor == player || ReadU32(actor + ENTITY_KIND_OFFSET) != SCRIPTABLE_NPC_KIND ||
             ReadU32(actor + ENTITY_TYPE_GROUP_OFFSET) != POLICE_GROUP ||
-            ReadU32(actor + 0x98u) || ReadU32(actor + 0x9Cu) || !IsLivePed(actor, &point))
+            ReadU32(actor + 0x98u) || ReadU32(actor + 0x9Cu) ||
+            ReadByte(actor + 0x5Eu) != 0 || !IsLivePed(actor, &point))
             continue;
         point.y += 1.25f;
         if (DriveByCandidate(view, point, 0.35f, 1, &score) && score < best)
@@ -727,9 +757,13 @@ static int FindDriveByTarget(uintptr_t world, uintptr_t player, DriveByView *vie
                 uintptr_t pedestrian = ReadU32(index);
                 int category = ReadByte(pedestrian + 0x15Au);
                 Vector3 point;
-                float score;
+                float score, life;
                 if (ReadByte(pedestrian) != 0 || ReadByte(pedestrian + 0xCu) != 1 ||
-                    (category != 1 && category != 3) || !ReadVector(pedestrian + 0x10u, &point))
+                    (category != 1 && category != 3) || !ReadVector(pedestrian + 0x10u, &point) ||
+                    !IsReadable((const void *)(pedestrian + 0x15Cu), sizeof(float)))
+                    continue;
+                life = *(volatile float *)(pedestrian + 0x15Cu);
+                if (!IsFinite(life) || life <= 0.0f)
                     continue;
                 point.y += 1.25f;
                 if (DriveByCandidate(view, point, 0.35f, 1, &score) && score < best)
@@ -740,6 +774,11 @@ static int FindDriveByTarget(uintptr_t world, uintptr_t player, DriveByView *vie
                 }
             }
         }
+    }
+    if (!found && wheelFound)
+    {
+        *result = wheelTarget;
+        return 1;
     }
     return found;
 }

@@ -12,8 +12,12 @@ controller through Steam Input, on a laptop or on a handheld.
 
 ## Drive-By Aim
 
-Hold LT (or the configured aim key) while firing from the driver seat. Lock-on prefers police-car wheels,
-then foot police, including ambient patrol officers. It excludes civilian cars, your own car and seated officers.
+Hold LT (or the configured aim key) while firing from the driver seat. While moving, lock-on prefers police-car
+tyres, then living foot police, including ambient patrol officers. When your car is stopped (speed <= 0.1 m/s),
+living reachable foot officers take priority; tyres are selected only when no eligible living officer remains.
+Dead officers, civilians, your own car and seated officers are excluded.
+Tyre aim is 85% of the wheel radius toward the vehicle's up axis, not at the hub/rim centre. This is a geometric
+rubber-band approximation that follows car tilt; an occluded tyre point is rejected instead of reverting to the hub.
 Search covers the full 180-degree left half-plane relative to the car, independently of camera direction.
 Finding a target does not grant a lock: the conservative reachable-shot filter still requires 40 to 140 degrees
 left of the car heading and elevation between -30 and +25 degrees. The former 20-degree camera acquisition
@@ -23,7 +27,8 @@ The weapon-frame firing line must always be clear. Nearby officers do not requir
 which can be obscured by your own car; wheels and distant officers retain that additional check.
 Officer LOS tolerates the body surface up to 0.35 metres before the chest aim point. A blocked/right-side target is dropped
 immediately, even with `require_line_of_sight = 0`. This is geometric assistance, not a guarantee against
-weapon spread, target movement or input latency. Wheel terminal-state flags are skipped.
+weapon spread, target movement or input latency. Wheel terminal-state flags are skipped; tyre endpoint tolerance
+is 0.12 metres rather than the full wheel radius.
 
 In the game's driving controls, set accelerator to **A (Joy0 Button 1)** and brake/reverse to
 **B (Joy0 Button 2)**, removing LT/RT from both primary and secondary pedal bindings.

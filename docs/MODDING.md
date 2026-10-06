@@ -147,8 +147,12 @@ quiet guard and allied bodyguard. Combine personality, senses, weapon/accuracy/h
 
 `vehicle_aim=1` enables driver-seat-only LT/O lock-on. GetActiveWorld permits cars, while GetWorld remains
 on-foot-only for B crouch (B can therefore be the brake). No shot/AI/physics setter is called by this feature.
-The target order is police wheels, scripted foot cops (group2), then ambient cops (categories1/3), choosing
-the best geometrically reachable officer across both officer pools. Civilians and seated actors are excluded.
+While moving, the target order is police tyres, then the best reachable living foot cop across scripted
+group2 actors and ambient categories1/3. When abs(C_car speed+688)<=0.1m/s, living foot cops take priority
+and tyres become the fallback. Scripted cops require positive finite health and a clear death-processed latch.
+Ambient cops additionally require finite positive+15C: pedestrian_hit VA4BD18A writes-1 and4BD64E writes0
+on terminal hit paths; do not treat the record's active flag alone as proof of life or read C_human health from it.
+Civilians and seated actors are excluded. Invalid speed does not grant stationary priority.
 Search uses the full driver-left180 degree half-plane, including its front/rear edges, relative to the car.
 Lock eligibility remains a SEPARATE conservative40..140 degree left/elevation-30..25/range80m filter; the
 180 degree search does not establish the native animation's full firing limits. No camera cone is required
@@ -170,7 +174,10 @@ Wheels and distant officers retain both rays. Failed collision binding/invalid f
 LOS is disabled in the INI. Tests cover both officer pools, body-surface hits, camera blocked/gun clear,
 gun blocked, wide wheel/distant-officer acquisition, independent search/lock limits and right-side rejection.
 This does not disable native carjack/arrest AI.
-Wheel line tolerance uses its radius+0.02; this is a geometric approximation, not an identified hit-mesh guarantee.
+Tyre point=hub+normalized vehicle world-up(C_car+D40)*radius*0.85; missing/invalid orientation rejects the wheel.
+This targets the outer rubber band, follows tilt and avoids the hub. It remains an approximation, not a verified
+model-specific tyre/rim mesh boundary. Tyre endpoint tolerance is0.12m, no longer radius+0.02, and blocked upper
+tyre points are rejected rather than aimed at the hub. Ground/arch clipping and actual tyre hits need runtime checks.
 Spread, motion, stale engine poses and input timing mean this feature cannot promise every bullet hits a tyre.
 Drive-by gains are separate from the persisted foot calibration; driver motion does not train foot sensitivity.
 In-game correction/framing still requires runtime confirmation. The experimental sandbox is now off by default

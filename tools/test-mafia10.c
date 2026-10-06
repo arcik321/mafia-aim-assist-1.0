@@ -98,10 +98,11 @@ static int __fastcall TestDriveByLine(void *collision, void *unused, const Vecto
     *hit = *from;
     if (testDriveByBlocked == 4)
         return from->z < -2.0f;
-    if (testDriveByBlocked == 2 || testDriveByBlocked == 3)
+    if (testDriveByBlocked == 2 || testDriveByBlocked == 3 || testDriveByBlocked == 5)
     {
         float distance = sqrtf(Dot(*delta, *delta));
-        float scale = testDriveByBlocked == 3 ? (distance - 0.3f) / distance : 1.0f;
+        float margin = testDriveByBlocked == 3 ? 0.3f : (testDriveByBlocked == 5 ? 0.08f : 0.0f);
+        float scale = (distance - margin) / distance;
         hit->x += delta->x * scale;
         hit->y += delta->y * scale;
         hit->z += delta->z * scale;
@@ -317,8 +318,10 @@ int main(void)
           DriveByView view;
           DriveByTarget selected;
           *(uint32_t *)(ownCar + ENTITY_KIND_OFFSET) = CAR_KIND;
+          *(float *)(ownCar + 0x688u) = 5.0f;
           *(uint32_t *)(policeCar + ENTITY_KIND_OFFSET) = CAR_KIND;
           policeCar[CAR_POLICE_OFFSET] = 1;
+          *(Vector3 *)(policeCar + 0xD40u) = (Vector3){0, 1, 0};
           *(uint32_t *)(policeCar + CAR_WHEEL_COUNT_OFFSET) = 1;
           *(uintptr_t *)(policeCar + CAR_WHEELS_OFFSET) = (uintptr_t)wheels;
           *(Vector3 *)(wheel + WHEEL_HUB_OFFSET) = (Vector3){-10, 0.5f, 0};
@@ -349,6 +352,31 @@ int main(void)
           Check(FindDriveByTarget((uintptr_t)mission, (uintptr_t)player, &view, &selected) &&
               selected.owner == (uintptr_t)policeCar && selected.kind == 1,
               "reachable police wheel takes priority over nearer foot officer");
+            Check(fabsf(selected.point.y - (0.5f + 0.35f * 0.85f)) < 0.0001f,
+                "wheel target lies on tyre band rather than hub centre");
+            {
+              Vector3 rubber;
+              Check(TyreAimPoint((Vector3){1, 2, 3}, (Vector3){1, 0, 0}, 0.4f, &rubber) &&
+                  fabsf(rubber.x - 1.34f) < 0.0001f && rubber.y == 2 && rubber.z == 3,
+                  "tyre radial aim follows vehicle tilt instead of world vertical");
+              Check(!TyreAimPoint((Vector3){1, 2, 3}, (Vector3){0, 0, 0}, 0.4f, &rubber),
+                  "unknown tyre orientation is rejected rather than falling back to rim");
+            }
+            *(float *)(ownCar + 0x688u) = 0.0f;
+            Check(FindDriveByTarget((uintptr_t)mission, (uintptr_t)player, &view, &selected) && selected.kind == 2,
+                "stopped car prioritizes a living foot officer over police wheels");
+            *(float *)(npc + ENTITY_HEALTH_OFFSET) = 0.0f;
+            Check(FindDriveByTarget((uintptr_t)mission, (uintptr_t)player, &view, &selected) && selected.kind == 1,
+                "dead foot officer is ignored and stopped car falls back to wheels");
+            *(float *)(npc + ENTITY_HEALTH_OFFSET) = 100.0f;
+            npc[0x5Eu] = 1;
+            Check(FindDriveByTarget((uintptr_t)mission, (uintptr_t)player, &view, &selected) && selected.kind == 1,
+                "death-processed officer cannot regain priority from stale positive health");
+            npc[0x5Eu] = 0;
+            *(float *)(ownCar + 0x688u) = -5.0f;
+            Check(FindDriveByTarget((uintptr_t)mission, (uintptr_t)player, &view, &selected) && selected.kind == 1,
+                "reversing car retains moving wheel priority");
+            *(float *)(ownCar + 0x688u) = 5.0f;
             view.aimDirection = (Vector3){0, 0, 1};
             Check(FindDriveByTarget((uintptr_t)mission, (uintptr_t)player, &view, &selected) && selected.kind == 1,
                 "reachable police wheel is acquired outside the old 20-degree camera cone");
@@ -372,9 +400,12 @@ int main(void)
           testDriveByBlocked = 2;
           Check(FindDriveByTarget((uintptr_t)mission, (uintptr_t)player, &view, &selected) && selected.kind == 1,
               "collision at wheel endpoint is accepted rather than treated as cover");
-          testDriveByBlocked = 3;
+          testDriveByBlocked = 5;
           Check(FindDriveByTarget((uintptr_t)mission, (uintptr_t)player, &view, &selected) && selected.kind == 1,
-              "visible tyre surface before wheel hub is accepted using its real radius");
+              "visible rubber surface just before the tyre aim point is accepted");
+          testDriveByBlocked = 3;
+          Check(FindDriveByTarget((uintptr_t)mission, (uintptr_t)player, &view, &selected) && selected.kind == 2,
+                "cover before the tyre band no longer passes a full-radius tolerance");
           testDriveByBlocked = 0;
           {
             LONG mouseX = 0, mouseY = 0;
@@ -435,11 +466,25 @@ int main(void)
               "civilian cars and non-police actors are excluded from drive-by");
           ambientCop[0xCu] = 1;
           ambientCop[0x15Au] = 1;
+          *(float *)(ambientCop + 0x15Cu) = 1.0f;
           *(Vector3 *)(ambientCop + 0x10u) = (Vector3){-7.5f, 0, 0};
           *(uintptr_t *)(testImage + CROWD_LIST_RVA) = (uintptr_t)crowd;
           *(uintptr_t *)(testImage + CROWD_LIST_RVA + 4u) = (uintptr_t)(crowd + 1);
           Check(FindDriveByTarget((uintptr_t)mission, (uintptr_t)player, &view, &selected) && selected.kind == 3,
               "ambient patrol officer is supported without casting crowd records as actors");
+            *(float *)(ownCar + 0x688u) = 0.0f;
+            policeCar[CAR_POLICE_OFFSET] = 1;
+            Check(FindDriveByTarget((uintptr_t)mission, (uintptr_t)player, &view, &selected) && selected.kind == 3,
+                "stopped car prefers living ambient patrol officer over tyres");
+            *(float *)(ambientCop + 0x15Cu) = 0.0f;
+            Check(FindDriveByTarget((uintptr_t)mission, (uintptr_t)player, &view, &selected) && selected.kind == 1,
+                "dead active ambient officer does not block tyre fallback");
+            *(float *)(ambientCop + 0x15Cu) = -1.0f;
+            Check(FindDriveByTarget((uintptr_t)mission, (uintptr_t)player, &view, &selected) && selected.kind == 1,
+                "terminal negative ambient damage state cannot be targeted");
+            *(float *)(ambientCop + 0x15Cu) = 1.0f;
+            policeCar[CAR_POLICE_OFFSET] = 0;
+            *(float *)(ownCar + 0x688u) = 5.0f;
             view.aimDirection = (Vector3){0, 0, 1};
             Check(FindDriveByTarget((uintptr_t)mission, (uintptr_t)player, &view, &selected) && selected.kind == 3,
                 "nearby ambient patrol officer also uses the full reachable left sector");
