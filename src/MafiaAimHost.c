@@ -17,6 +17,61 @@
 typedef void (__cdecl *AimMouseFn)(LONG *lx, LONG *ly);
 typedef void (__cdecl *AimInitFn)(void);
 typedef int (__cdecl *AimCrouchFn)(uintptr_t human, int requested);
+typedef struct HostVector3 { float x, y, z; } HostVector3;
+typedef int (__cdecl *AimShotFn)(uintptr_t game, uintptr_t shooter, HostVector3 *origin,
+                                HostVector3 *direction, float *power, int *count);
+static AimShotFn volatile g_shot;
+typedef float (__cdecl *AimHitFn)(uintptr_t game, uintptr_t victim, uintptr_t source, int type, float damage);
+static AimHitFn volatile g_hitDamage;
+typedef int (__cdecl *AimWheelHitFn)(uintptr_t game, uintptr_t car, uintptr_t source,
+                                    int type, uintptr_t frame, uint32_t shot, uintptr_t *wheel, int *index);
+static AimWheelHitFn volatile g_wheelHit;
+static uint32_t g_playerShotSequence;
+static SRWLOCK g_logicLock = SRWLOCK_INIT;
+typedef void (__fastcall *HostShootFn)(void *game, void *unused, void *shooter,
+                                     HostVector3 origin, HostVector3 direction,
+                                     float power, int effect, void *frame, int count);
+static HostShootFn g_originalShoot;
+static void TraceNativeShot(void *game, void *shooter);
+
+static void __fastcall ArcadeShootHook(void *game, void *unused, void *shooter,
+                                     HostVector3 origin, HostVector3 direction,
+                                     float power, int effect, void *frame, int count)
+{
+    HostVector3 adjustedOrigin = origin, adjustedDirection = direction;
+    float adjustedPower = power;
+    int adjustedCount = count, accepted = 0;
+    AimShotFn callback;
+    (void)unused;
+    AcquireSRWLockShared(&g_logicLock);
+    callback = g_shot;
+    if (callback)
+    {
+        __try
+        {
+            accepted = callback((uintptr_t)game, (uintptr_t)shooter, &adjustedOrigin,
+                                &adjustedDirection, &adjustedPower, &adjustedCount);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            g_shot = NULL;
+        }
+    }
+    ReleaseSRWLockShared(&g_logicLock);
+    if (accepted)
+    {
+        origin = adjustedOrigin;
+        direction = adjustedDirection;
+        power = adjustedPower;
+        count = adjustedCount;
+    }
+    if (game && *(void **)((BYTE *)game + 0xE4u) == shooter && ++g_playerShotSequence == 0)
+        ++g_playerShotSequence;
+    g_originalShoot(game, NULL, shooter, origin, direction, power, effect, frame, count);
+    if (accepted)
+        TraceNativeShot(game, shooter);
+}
+
 typedef void (__fastcall *HumanCrouchFn)(void *human, void *unused, int requested);
 typedef HRESULT (STDMETHODCALLTYPE *GetDeviceStateFn)(void *self, DWORD size, LPVOID data);
 typedef HRESULT (WINAPI *DirectInput8CreateFn)(HINSTANCE, DWORD, REFIID, LPVOID *, LPUNKNOWN);
@@ -72,11 +127,43 @@ static void Log(const char *format, ...)
     FlushFileBuffers(g_log);
 }
 
+static void TraceNativeShot(void *game, void *shooter)
+{
+    static int traced;
+    uintptr_t first, end, record;
+    HostVector3 position, velocity;
+    float damage, range;
+    if (traced >= 24)
+        return;
+    __try
+    {
+        first = *(uintptr_t *)((BYTE *)game + 0x1D8u);
+        end = *(uintptr_t *)((BYTE *)game + 0x1DCu);
+        if (!first || end <= first || (end - first) % 0x5Cu || end - first > 0x10000u)
+            return;
+        record = end - 0x5Cu;
+        if (*(void **)(record + 0x2Cu) != shooter)
+            return;
+        position = *(HostVector3 *)record;
+        velocity = *(HostVector3 *)(record + 0xCu);
+        damage = *(float *)(record + 0x28u);
+        range = *(float *)(record + 0x18u);
+        ++traced;
+        Log("native bullet owner=%p damage=%.1f range=%.2f pos=%.2f,%.2f,%.2f vel=%.3f,%.3f,%.3f",
+            shooter, damage, range, position.x, position.y, position.z, velocity.x, velocity.y, velocity.z);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        Log("native bullet trace unavailable");
+    }
+}
+
 /* ---- hot-reloadable logic ---------------------------------------------- */
 
 static void CallAim(LONG *lx, LONG *ly)
 {
     AimMouseFn fn;
+    AcquireSRWLockShared(&g_logicLock);
     InterlockedIncrement(&g_inFlight);
     fn = g_aim;
     if (fn)
@@ -92,6 +179,7 @@ static void CallAim(LONG *lx, LONG *ly)
         }
     }
     InterlockedDecrement(&g_inFlight);
+    ReleaseSRWLockShared(&g_logicLock);
 }
 
 static int ReadStamp(FILETIME *time, DWORD *size)
@@ -111,7 +199,9 @@ static int ReloadLogic(void)
     AimMouseFn fn;
     AimInitFn init;
     AimCrouchFn crouch;
-    int i;
+    AimShotFn shot;
+    AimHitFn hitDamage;
+    AimWheelHitFn wheelHit;
 
     GetTempPathW(MAX_PATH, temp);
     swprintf(copy, MAX_PATH, L"%lsMafiaAimLogic_%lu_%d.dll", temp, GetCurrentProcessId(), ++g_generation);
@@ -126,6 +216,9 @@ static int ReloadLogic(void)
     fn = (AimMouseFn)GetProcAddress(module, "AimMouse");
     init = (AimInitFn)GetProcAddress(module, "AimInit");
     crouch = (AimCrouchFn)GetProcAddress(module, "AimCrouch");
+    shot = (AimShotFn)GetProcAddress(module, "AimArcadeShot");
+    hitDamage = (AimHitFn)GetProcAddress(module, "AimArcadeHitDamage");
+    wheelHit = (AimWheelHitFn)GetProcAddress(module, "AimArcadeWheelHit");
     if (!fn)
     {
         Log("logic has no AimMouse export");
@@ -136,18 +229,21 @@ static int ReloadLogic(void)
     if (init)
         init();
 
+    AcquireSRWLockExclusive(&g_logicLock);
     old = g_logic;
     g_logic = module;
     g_aim = fn;
     g_crouch = crouch;
-    for (i = 0; i < 100 && g_inFlight > 0; ++i)
-        Sleep(10);
+    g_shot = shot;
+    g_hitDamage = hitDamage;
+    g_wheelHit = wheelHit;
     if (old)
     {
         FreeLibrary(old);
         DeleteFileW(g_loadedCopy);
     }
     lstrcpyW(g_loadedCopy, copy);
+    ReleaseSRWLockExclusive(&g_logicLock);
     Log("logic loaded (generation %d)", g_generation);
     return 1;
 }
@@ -259,6 +355,7 @@ static void __fastcall PlayerCrouchHook(void *human, void *unused, int requested
 {
     AimCrouchFn callback;
     (void)unused;
+    AcquireSRWLockShared(&g_logicLock);
     InterlockedIncrement(&g_inFlight);
     callback = g_crouch;
     if (callback)
@@ -274,6 +371,7 @@ static void __fastcall PlayerCrouchHook(void *human, void *unused, int requested
         }
     }
     InterlockedDecrement(&g_inFlight);
+    ReleaseSRWLockShared(&g_logicLock);
     g_originalCrouch(human, NULL, requested);
 }
 
@@ -305,6 +403,195 @@ static void InstallCrouchHook(void)
     Log("Mafia 1.0 player crouch call hooked");
 }
 
+typedef BYTE (__fastcall *HostHumanHitFn)(void *human, void *unused, int type,
+                                        const HostVector3 *position, const HostVector3 *normal,
+                                        const HostVector3 *direction, float damage, void *source,
+                                        DWORD bodyPart, void *frame);
+static HostHumanHitFn g_originalHumanHit;
+
+static BYTE __fastcall TracePoliceHit(void *human, void *unused, int type,
+                                     const HostVector3 *position, const HostVector3 *normal,
+                                     const HostVector3 *direction, float damage, void *source,
+                                     DWORD bodyPart, void *frame)
+{
+    static int traced;
+    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    uintptr_t mission = *(uintptr_t *)(base + 0x25115Cu);
+    uintptr_t game = mission ? *(uintptr_t *)(mission + 0x24u) : 0;
+    int trace = game && *(void **)(game + 0xE4u) == source &&
+        *(DWORD *)((BYTE *)human + 0xF4Cu) == 2 && traced < 24;
+    float before = *(float *)((BYTE *)human + 0x644u);
+    AimHitFn callback;
+    BYTE result;
+    static int playerTraced;
+    int tracePlayer = game && *(void **)(game + 0xE4u) == human && playerTraced < 12;
+    (void)unused;
+    if (tracePlayer)
+    {
+        BYTE *h = (BYTE *)human;
+        Log("player Hit entry type=%d damage=%.2f hp=%.1f src=%p part=%lu state=%lu f1E5=%d f1EC=%d f1FE=%d f21C=%d fAF5=%d f581=%d",
+            type, damage, before, source, (unsigned long)bodyPart, (unsigned long)*(DWORD *)(h + 0x40Cu),
+            h[0x1E5], h[0x1EC], h[0x1FE], h[0x21C], h[0xAF5], h[0x581]);
+    }
+    if (trace)
+        Log("police Hit entry actor=%p type=%d damage=%.2f hp=%.2f alive=%d part=%lu flags94=%lu",
+            human, type, damage, before, *((BYTE *)human + 0x5Du),
+            (unsigned long)bodyPart, (unsigned long)*(DWORD *)((BYTE *)human + 0x94u));
+    AcquireSRWLockShared(&g_logicLock);
+    callback = g_hitDamage;
+    if (callback)
+    {
+        __try
+        {
+            float adjusted = callback(game, (uintptr_t)human, (uintptr_t)source, type, damage);
+            if (_finite(adjusted) && adjusted >= 0.0f)
+                damage = adjusted;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            g_hitDamage = NULL;
+        }
+    if (tracePlayer)
+    {
+        BYTE *h = (BYTE *)human;
+        ++playerTraced;
+        Log("player Hit exit hp=%.1f state=%lu f1E5=%d f1EC=%d f1FE=%d f21C=%d fAF5=%d f581=%d weapon=%lu",
+            *(float *)(h + 0x644u), (unsigned long)*(DWORD *)(h + 0x40Cu),
+            h[0x1E5], h[0x1EC], h[0x1FE], h[0x21C], h[0xAF5], h[0x581], (unsigned long)*(DWORD *)(h + 0x1E8u));
+    }
+    }
+    ReleaseSRWLockShared(&g_logicLock);
+    result = g_originalHumanHit(human, NULL, type, position, normal, direction, damage, source, bodyPart, frame);
+    if (trace)
+    {
+        ++traced;
+        Log("police Hit exit actor=%p hp=%.2f alive=%d death=%d", human,
+            *(float *)((BYTE *)human + 0x644u), *((BYTE *)human + 0x5Du), *((BYTE *)human + 0x5Eu));
+    }
+    return result;
+}
+
+static void InstallPoliceHitTrace(void)
+{
+    static const BYTE call[] = {0xE8, 0xD0, 0x44, 0x08, 0x00};
+    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    BYTE *site = (BYTE *)(base + 0x01223Bu);
+    DWORD protection, restored;
+    int32_t displacement;
+    if (memcmp(site, call, 5) != 0 ||
+        memcmp((void *)(base + 0x096710u), "\x8B\x44\x24\x04\x83\xEC\x34", 7) != 0)
+    {
+        Log("Police hit trace rejected: call or entry signature mismatch");
+        return;
+    }
+    g_originalHumanHit = (HostHumanHitFn)(base + 0x096710u);
+    if (!VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &protection))
+        return;
+    displacement = (int32_t)((uintptr_t)TracePoliceHit - (uintptr_t)(site + 5));
+    memcpy(site + 1, &displacement, 4);
+    VirtualProtect(site, 5, protection, &restored);
+    FlushInstructionCache(GetCurrentProcess(), site, 5);
+    Log("Police actual-hit trace installed; native damage arguments retained");
+}
+
+static HostHumanHitFn g_originalCarHit;
+typedef void (__fastcall *HostDetachWheelFn)(void *car, int index,
+                                            const HostVector3 *position, const HostVector3 *impulse);
+static HostDetachWheelFn g_detachWheel;
+
+static BYTE __fastcall ArcadeCarHit(void *car, void *unused, int type,
+                                   const HostVector3 *position, const HostVector3 *normal,
+                                   const HostVector3 *direction, float damage, void *source,
+                                   DWORD bodyPart, void *frame)
+{
+    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    uintptr_t mission = *(uintptr_t *)(base + 0x25115Cu);
+    uintptr_t game = mission ? *(uintptr_t *)(mission + 0x24u) : 0;
+    uintptr_t wheel = 0;
+    int index = -1, stage = 0;
+    AimWheelHitFn callback;
+    BYTE result;
+    (void)unused;
+    AcquireSRWLockShared(&g_logicLock);
+    callback = g_wheelHit;
+    if (callback)
+    {
+        __try
+        {
+            stage = callback(game, (uintptr_t)car, (uintptr_t)source, type,
+                             (uintptr_t)frame, g_playerShotSequence, &wheel, &index);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            g_wheelHit = NULL;
+        }
+    }
+    ReleaseSRWLockShared(&g_logicLock);
+    result = g_originalCarHit(car, NULL, type, position, normal, direction, stage ? 0.0f : damage,
+                             source, bodyPart, frame);
+    if (stage == 1 && wheel)
+        *(DWORD *)(wheel + 0x120u) |= 0x80000000u;
+    else if (stage == 2 && wheel && index >= 0 && g_detachWheel)
+    {
+        HostVector3 releaseMotion = {0, 0, 0};
+        g_detachWheel(car, index, &releaseMotion, NULL);
+        Log("player tyre detachment: car=%p index=%d flags=0x%08lX", car, index,
+            (unsigned long)*(DWORD *)(wheel + 0x120u));
+    }
+    return result;
+}
+
+static void InstallArcadeWheelHitHook(void)
+{
+    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    void **primary = (void **)(base + 0x23BC08u);
+    void **extended = (void **)(base + 0x23BD68u);
+    if (primary[31] != (void *)(base + 0x06A670u) ||
+        extended[31] != primary[31] ||
+        memcmp((void *)(base + 0x06A670u), "\x81\xEC\xF0\x00\x00\x00", 6) != 0 ||
+        memcmp((void *)(base + 0x06E0C0u), "\x83\xEC\x2C\x8B\x81\x24\x0D\x00\x00", 9) != 0)
+    {
+        Log("Arcade wheel hit hook rejected: native signatures mismatch");
+        return;
+    }
+    g_originalCarHit = (HostHumanHitFn)primary[31];
+    g_detachWheel = (HostDetachWheelFn)(base + 0x06E0C0u);
+    if (!PatchVtableSlot(primary, 31, (void *)ArcadeCarHit) ||
+        !PatchVtableSlot(extended, 31, (void *)ArcadeCarHit))
+        return;
+    Log("Arcade confirmed wheel hits installed: puncture then native detachment");
+}
+
+static void InstallArcadeShotHook(void)
+{
+    static const BYTE signatures[2][5] = {
+        {0xE8, 0xA6, 0xEC, 0x13, 0x00},
+        {0xE8, 0x01, 0xE1, 0x13, 0x00}
+    };
+    static const uintptr_t sites[2] = {0x0A5145u, 0x0A5CEAu};
+    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    int index;
+    if (memcmp((const void *)(base + 0x1E3DF0u), "\x81\xEC\xD4\x00\x00\x00", 6) != 0)
+        return;
+    for (index = 0; index < 2; ++index)
+        if (memcmp((const void *)(base + sites[index]), signatures[index], 5) != 0)
+            return;
+    g_originalShoot = (HostShootFn)(base + 0x1E3DF0u);
+    for (index = 0; index < 2; ++index)
+    {
+        BYTE *site = (BYTE *)(base + sites[index]);
+        DWORD protection, restored;
+        int32_t displacement;
+        if (!VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &protection))
+            return;
+        displacement = (int32_t)((uintptr_t)ArcadeShootHook - (uintptr_t)(site + 5));
+        memcpy(site + 1, &displacement, sizeof(displacement));
+        VirtualProtect(site, 5, protection, &restored);
+        FlushInstructionCache(GetCurrentProcess(), site, 5);
+    }
+    Log("Player car arcade shot hook installed; NPC and on-foot shots forwarded");
+}
+
 static int __cdecl TutorialFreerideAction(void)
 {
     g_freerideStore(1, 0, 1.0f, 1.0f, 0.0f);
@@ -320,7 +607,6 @@ static void __fastcall TutorialPoliceState(void *manager, void *unused, int enab
     g_policeState(manager, NULL, g_tutorialFreeride ? 0 : enabled, vehicleTier, cacheFlag);
 }
 
-typedef struct HostVector3 { float x, y, z; } HostVector3;
 typedef void (__fastcall *HostEntityTickFn)(void *entity, void *unused, DWORD delta);
 typedef void *(__fastcall *HostCreateActorFn)(void *mission, void *unused, int kind);
 typedef int (__fastcall *HostModelOpenFn)(void *cache, void *unused, void *model,
@@ -661,6 +947,9 @@ static DWORD WINAPI InstallThread(void *unused)
     DWORD length;
     (void)unused;
     InstallCrouchHook();
+    InstallArcadeShotHook();
+    InstallPoliceHitTrace();
+    InstallArcadeWheelHitHook();
     length = GetModuleFileNameA(NULL, iniPath, MAX_PATH);
     if (length && length < MAX_PATH - 32)
     {

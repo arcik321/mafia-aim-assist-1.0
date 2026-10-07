@@ -1,4 +1,9 @@
-# Mafia Aim Assist
+# Mafia Aim Assist (experimental, Mafia PC 1.0 only)
+
+> **Experimental build for Mafia: The City of Lost Heaven, PC version 1.0 (`Master 1.0`).**
+> This is a work in progress: it hooks and patches the game process in memory, has been tested by one player on
+> one machine, and may crash, behave oddly or change between commits. It does NOT work with the 1.3 / Steam
+> re-release (see the separate stable project). Use at your own risk, back up your saves and the original DLLs.
 
 Lock-on aiming and full Xbox controller support for **Mafia: The City of Lost Heaven** (2002, PC).
 
@@ -12,9 +17,50 @@ controller through Steam Input, on a laptop or on a handheld.
 
 ## Drive-By Aim
 
-Hold LT (or the configured aim key) while firing from the driver seat. While moving, lock-on prefers police-car
-tyres, then living foot police, including ambient patrol officers. When your car is stopped (speed <= 0.1 m/s),
-living reachable foot officers take priority; tyres are selected only when no eligible living officer remains.
+**Arcade is enabled by default:** hold LT/O to designate a living police officer or police-car tyre on any side,
+then use the game's normal fire control. Only real shots by the active player in the driver seat are redirected.
+The projectile starts 2 metres before an officer or 4 metres before a tyre, rather than inside the target collider,
+and travels toward the fresh target point with one pellet (no native spread),
+using a finite ray displacement of 4 metres for officers or 6 metres for tyres. The native engine takes vector
+length as bullet range: a unit vector would expire after 1 metre, before reaching these targets.
+This intentionally bypasses car-side and cover limits,
+including walls; it is a single-player gameplay cheat, not a realistic visibility predictor.
+Visible mouse aim correction is retained with LT/O. Without a lock or valid target, player-driver shots keep their
+original origin, direction, damage and pellet count. With `vehicle_one_shot = 1`, a confirmed native hit on a
+living scripted police officer applies lethal damage at HumanHit, not to every projectile or car.
+This also covers manual driver shots without LT/O or fresh camera matrices. NPC and on-foot shots remain unchanged.
+In arcade mode, the first confirmed driver hit on a police-car wheel punctures its tyre; the second hit on that
+same wheel invokes native wheel detachment. Different wheels have independent counts; repeated notifications
+for one shot do not count twice. Body hits and misses do not advance the wheel rule. Punctured wheels remain
+targetable, detached wheels do not. Reloading the logic resets the counters.
+Ammo, weapon
+timing and native hit/death handling remain in the engine; no direct kill or explosion is called by this feature.
+Runtime tracing established an actual officer hit with projectile damage 10000 but HumanHit damage 0 and
+health unchanged. The new confirmed-hit override and two-hit wheel rule have x86 regression coverage;
+native death animations and detached-wheel physics still require in-game confirmation.
+Set `vehicle_one_shot = 0` to retain normal damage with arcade accuracy, or `vehicle_arcade = 0` for the
+geometric mode described below. The host shot hook requires a game restart after installing this build.
+
+Hold LT (or the configured aim key) while firing from the driver seat. Police-car/mafia-car wheels, living foot
+police, mafiosi and ambient patrol officers share ONE target pool with equal priority: the first lock is the target
+nearest the crosshair, and it stays until it becomes invalid. While locked, flick the right stick **left, right, up or
+down** to move to the next target in that direction on screen (nearest first; e.g. left-near, centre-far, right-near are
+visited in that order). While a target is locked the right stick no longer rotates the camera; without a lock it does.
+Visibility: wheels of stopped cars (with someone hostile inside) and everything in geometric mode must be inside the
+camera's visible window (about 49 degrees to each side, 29 up/down) with a clear camera line. In arcade mode every
+police officer and mafioso on foot, and every wheel of a DRIVING hostile (police or mafia) car, can be locked even when
+it is hidden or behind your own car; flick the right stick to reach targets behind the camera.
+
+Priorities: people on foot (police, mafiosi) come first, because they block the road and shoot. When a hostile car
+is driving (a chase), the tyres of moving hostile cars come first instead. Tyres of a stopped car are only lockable
+while someone hostile is still inside; an empty stopped car is ignored. The right-stick switch can still reach
+every visible target.
+
+Optional test cheats (off by default, `[cheats]` section of the INI): `player_health = 1000` raises the health
+ceiling and fills the player once; `car_acceleration_percent = 200` multiplies the motor force of the car you drive
+by 2 (it restores the original factor when you leave the car or switch the option off).
+Wheels include police cars, cars crewed by police/mafiosi and spawned mafia hit-cars, including cars owned only by
+the ambient-traffic manager (patrol cars with shotguns). Mafiosi on foot are lockable and die from one confirmed hit.
 Dead officers, civilians, your own car and seated officers are excluded.
 Tyre aim is 85% of the wheel radius toward the vehicle's up axis, not at the hub/rim centre. This is a geometric
 rubber-band approximation that follows car tilt; an occluded tyre point is rejected instead of reverting to the hub.
@@ -35,6 +81,13 @@ In the game's driving controls, set accelerator to **A (Joy0 Button 1)** and bra
 Keep **RT (Joy0 Button 8)** for fire; the mod reads **LT** for lock-on. B crouch remains on-foot only.
 The right stick remains manual aiming control in the car; on-foot target/stature flicks do not run on car targets.
 Passenger seats are not supported by this driver-left implementation. Disable with `vehicle_aim = 0`.
+
+With `vehicle_free_camera = 1` (default) the driver camera uses the engine's own free-look mode: it stays locked
+behind the car and the right stick (or mouse) rotates it instead of the camera drifting. Leaving the car, a
+passenger seat, races and cutscene cameras restore/keep the native camera; `0` disables the change.
+An already held lock stays on its wheel instead of hopping between wheels as the car moves.
+Rejected player-car shots and hits on police cars without a matching wheel are written to
+`%TEMP%\MafiaAimLogic.log`, together with a short trace of driver state changes (used to find what holsters the weapon).
 
 ## Experimental Sandbox
 
@@ -161,7 +214,9 @@ logs listed under [Troubleshooting](#troubleshooting).
 | `experimental_crouch_head_aim` | `1` | Fallback only: lower the height-based head point when the target's `+0x1e4` byte is nonzero. |
 | `aim_key` | `O` | Keyboard key for lock-on. Set one letter/digit, `F1`-`F12`, `SPACE`, `ENTER`, `TAB`, `ESC`, `SHIFT`, `CTRL`, `ALT`, `CAPSLOCK` or `BACKSPACE`. The left trigger remains enabled. |
 | `crouch_toggle` | `1` | Toggle crouch with Xbox B while on foot, through the game's normal player update. The 1.0 callsite and setter signatures are validated before hooking. Set `0` to disable. |
-| `vehicle_aim` | `1` | Driver-left police wheel/foot-officer lock-on; mandatory firing-line checks. Passenger seats are excluded. |
+| `vehicle_aim` | `1` | Driver-seat police tyre/foot-officer targeting. Arcade allows all sides; geometric mode requires firing clearance. Passenger seats are excluded. |
+| `vehicle_arcade` | `1` | Redirect actual locked player-driver shots from close to their targets; allows all sides and bypasses cover. `0` restores geometric drive-by assistance. |
+| `vehicle_one_shot` | `1` | High damage for player-driver shots in arcade, including manual shots without a lock. NPC/on-foot shots stay native. |
 | `aim_response_percent` | `70` | Lock-on strength. Lower it for a slower approach; accepted range is `25` to `150`. Changes are read while the game runs. |
 | `require_line_of_sight` | `1` | Require an unobstructed collision line to acquire or keep a target. Set `0` to disable. If the supported game function cannot be validated, the mod logs the issue and falls back to the previous targeting behavior. |
 | `prioritize_enemies` | `1` | Prefer scripted mission enemies (AI group 4) when acquiring or manually switching. A locked target is not automatically replaced. Falls back to another eligible person if no group-4 target is available; set `0` to disable. |

@@ -55,6 +55,8 @@
 
 #define MAX_ENTITIES        512u
 #define MAX_TARGET_DISTANCE 80.0f
+#define DRIVE_VIEW_HALF_WIDTH  0.85f
+#define DRIVE_VIEW_HALF_HEIGHT 0.5f
 #define MIN_FORWARD_DOT     0.985f /* cos(10 degrees) */
 #define ENEMY_PRIORITY_FORWARD_DOT 0.9063f /* cos(25 degrees) */
 #define SWITCH_MIN_FORWARD_DOT 0.5f /* switching may reach people up to 60 degrees off the crosshair */
@@ -105,6 +107,11 @@ static int g_animatedHeadAim = 1;
 static float g_animatedHeadForward = 0.08f;
 static int g_crouchToggleEnabled = 1;
 static int g_vehicleAimEnabled = 1;
+static int g_vehicleArcade = 1;
+static int g_vehicleOneShot = 1;
+static int g_vehicleFreeCamera = 1;
+static int g_cheatHealth;
+static float g_cheatAcceleration = 1.0f;
 static int g_crouchDesired = -1;
 static uintptr_t g_crouchPlayer;
 static int g_lineTestState;
@@ -547,14 +554,87 @@ static int TyreAimPoint(Vector3 hub, Vector3 up, float radius, Vector3 *point)
     return IsFinite(point->x) && IsFinite(point->y) && IsFinite(point->z);
 }
 
+#define TRAFFIC_MANAGER_KIND     0xCu
+#define TRAFFIC_ELEMENTS_OFFSET  0x74u
+#define TRAFFIC_COUNT_OFFSET     0x220u
+#define MAFIA_CREWS_BEGIN_RVA    0x256170u
+#define MAFIA_CREWS_END_RVA      0x256174u
+#define CAR_SEATS_BEGIN_OFFSET   0x210Cu
+#define CAR_SEATS_END_OFFSET     0x2110u
+#define MAX_CANDIDATE_CARS       192u
+
+static int g_driveSwitch;
+
+static int HostileGroup(uint32_t group)
+{
+    return group == POLICE_GROUP || group == MISSION_ENEMY_GROUP;
+}
+
+static int HasHostileOccupant(uintptr_t car)
+{
+    uintptr_t seats = ReadU32(car + CAR_SEATS_BEGIN_OFFSET);
+    uintptr_t end = ReadU32(car + CAR_SEATS_END_OFFSET);
+    uintptr_t count, seat;
+    if (seats < 0x10000u || end < seats || (end - seats) % 0xA0u)
+        return 0;
+    count = (end - seats) / 0xA0u;
+    if (!count || count > 8u || !IsReadable((const void *)seats, count * 0xA0u))
+        return 0;
+    for (seat = 0; seat < count; ++seat)
+    {
+        uintptr_t actor = ReadU32(seats + seat * 0xA0u + 0x10u);
+        if (actor >= 0x10000u && ReadU32(actor + ENTITY_KIND_OFFSET) == SCRIPTABLE_NPC_KIND &&
+            HostileGroup(ReadU32(actor + ENTITY_TYPE_GROUP_OFFSET)) &&
+            ReadByte(actor + 0x5Du) == 1 && ReadByte(actor + 0x5Eu) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static int InMafiaCrew(uintptr_t car)
+{
+    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    uintptr_t first = ReadU32(base + MAFIA_CREWS_BEGIN_RVA);
+    uintptr_t end = ReadU32(base + MAFIA_CREWS_END_RVA);
+    uintptr_t record;
+    if (first < 0x10000u || end < first || (end - first) % 12u || end - first > 12u * 64u ||
+        !IsReadable((const void *)first, end - first))
+        return 0;
+    for (record = first; record < end; record += 12u)
+        if (ReadU32(record) == car)
+            return 1;
+    return 0;
+}
+
+/* Police cars, cars crewed by hostile actors and spawned mafia crews are valid wheel targets. */
+static int IsHostileCar(uintptr_t car)
+{
+    return ReadU32(car + ENTITY_KIND_OFFSET) == CAR_KIND && ReadByte(car + 0x5Eu) == 0 &&
+        (ReadByte(car + CAR_POLICE_OFFSET) == 1 || HasHostileOccupant(car) || InMafiaCrew(car));
+}
+
+static int IsMovingCar(uintptr_t car)
+{
+    float speed;
+    if (!IsReadable((const void *)(car + 0x688u), sizeof(float)))
+        return 0;
+    speed = *(volatile float *)(car + 0x688u);
+    return IsFinite(speed) && fabsf(speed) > 1.0f;
+}
+
+/* Wheels count only while the car is driving, or when it still carries someone hostile. */
+static int IsWheelWorthTargeting(uintptr_t car)
+{
+    return IsMovingCar(car) || HasHostileOccupant(car);
+}
+
 static int ReadPoliceWheel(uintptr_t car, uint32_t index, Vector3 *point, float *radius)
 {
     uint32_t count = ReadU32(car + CAR_WHEEL_COUNT_OFFSET);
     uintptr_t wheels = ReadU32(car + CAR_WHEELS_OFFSET);
     uintptr_t wheel;
     Vector3 up;
-    if (ReadU32(car + ENTITY_KIND_OFFSET) != CAR_KIND || ReadByte(car + CAR_POLICE_OFFSET) != 1 ||
-        ReadByte(car + 0x5Eu) != 0 || !count || count > 8 || index >= count ||
+    if (!IsHostileCar(car) || !IsWheelWorthTargeting(car) || !count || count > 8 || index >= count ||
         !IsReadable((void *)wheels, count * sizeof(uint32_t)))
         return 0;
     wheel = ReadU32(wheels + index * 4u);
@@ -566,21 +646,42 @@ static int ReadPoliceWheel(uintptr_t car, uint32_t index, Vector3 *point, float 
     return ReadVector(car + 0xD40u, &up) && TyreAimPoint(*point, up, *radius, point);
 }
 
+/* True when the point lies inside the camera's visible window, so only what the player can see is lockable. */
+static int DriveByOnScreen(const DriveByView *view, Vector3 point)
+{
+    Vector3 d = Subtract(point, view->cameraPosition);
+    Vector3 right = {view->aimDirection.z, 0.0f, -view->aimDirection.x};
+    Vector3 up;
+    float forward, horizontal, vertical;
+    if (!Normalize(&d) || !Normalize(&right))
+        return 0;
+    up = (Vector3){view->aimDirection.y * right.z - view->aimDirection.z * right.y,
+                   view->aimDirection.z * right.x - view->aimDirection.x * right.z,
+                   view->aimDirection.x * right.y - view->aimDirection.y * right.x};
+    forward = Dot(d, view->aimDirection);
+    if (forward < 0.1f)
+        return 0;
+    horizontal = atan2f(Dot(d, right), forward);
+    vertical = atan2f(Dot(d, up), forward);
+    return fabsf(horizontal) <= DRIVE_VIEW_HALF_WIDTH && fabsf(vertical) <= DRIVE_VIEW_HALF_HEIGHT;
+}
+
+/* requireVisible: arcade mode locks people and wheels of driving hostile cars even when hidden or behind the camera. */
 static int DriveByCandidate(DriveByView *view, Vector3 point, float margin,
-                            int footOfficer, float *score)
+                            int requireVisible, float *score)
 {
     Vector3 direction = Subtract(point, view->cameraPosition);
-    Vector3 fromWeapon = Subtract(point, view->origin);
     float distanceSquared = Dot(direction, direction);
     float alignment;
-    int nearbyOfficer = footOfficer && Dot(fromWeapon, fromWeapon) <= 64.0f;
+    int checkVisibility = requireVisible || !g_vehicleArcade;
     if (distanceSquared < 0.0625f || distanceSquared > MAX_TARGET_DISTANCE * MAX_TARGET_DISTANCE ||
-        !DriveBySearchSector(view->origin, view->forward, point) ||
-        !DriveByReachable(view->origin, view->forward, point) || !Normalize(&direction))
+        (!g_vehicleArcade && (!DriveBySearchSector(view->origin, view->forward, point) ||
+                             !DriveByReachable(view->origin, view->forward, point))) ||
+        !Normalize(&direction) || (checkVisibility && !DriveByOnScreen(view, point)))
         return 0;
     alignment = Dot(direction, view->aimDirection);
-    if (!DriveByLineClear(view->origin, point, margin) ||
-        (!nearbyOfficer && !DriveByLineClear(view->cameraPosition, point, margin)))
+    if ((checkVisibility && !DriveByLineClear(view->cameraPosition, point, margin)) ||
+        (!g_vehicleArcade && !DriveByLineClear(view->origin, point, margin)))
         return 0;
     *score = (1.0f - alignment) * 10000.0f + distanceSquared;
     return 1;
@@ -680,70 +781,110 @@ static int ListBounds(uintptr_t world, uintptr_t *begin, uintptr_t *count)
     return total != 0;
 }
 
-static int IsStoppedCar(uintptr_t car)
+/* Adds one car to a bounded unique list. */
+static void AddCandidateCar(uintptr_t *cars, uintptr_t *count, uintptr_t car)
 {
-    float speed;
-    if (!IsReadable((const void *)(car + 0x688u), sizeof(float)))
-        return 0;
-    speed = *(volatile float *)(car + 0x688u);
-    return IsFinite(speed) && fabsf(speed) <= 0.1f;
+    uintptr_t index;
+    if (car < 0x10000u || *count >= MAX_CANDIDATE_CARS || ReadU32(car + ENTITY_KIND_OFFSET) != CAR_KIND)
+        return;
+    for (index = 0; index < *count; ++index)
+        if (cars[index] == car)
+            return;
+    cars[(*count)++] = car;
 }
 
-static int FindDriveByTarget(uintptr_t world, uintptr_t player, DriveByView *view,
-                             DriveByTarget *result)
+/* Cars from the actor lists, the ambient-traffic manager's elements and spawned mafia crews. */
+static uintptr_t CollectCars(uintptr_t world, uintptr_t *cars)
 {
-    uintptr_t begin, count, index;
-    float best = 1.0e20f;
-    int found = 0;
-    int wheelFound;
-    DriveByTarget wheelTarget = {0};
-    if (!ListBounds(world, &begin, &count))
-        return 0;
-    for (index = 0; index < count; ++index)
+    uintptr_t begin, count, index, total = 0;
+    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    uintptr_t crews = ReadU32(base + MAFIA_CREWS_BEGIN_RVA), crewsEnd = ReadU32(base + MAFIA_CREWS_END_RVA);
+    if (ListBounds(world, &begin, &count))
     {
-        uintptr_t car = ReadU32(begin + index * 4u);
-        uint32_t wheel, wheels;
-        if (car == view->car || ReadU32(car + ENTITY_KIND_OFFSET) != CAR_KIND)
-            continue;
-        wheels = ReadU32(car + CAR_WHEEL_COUNT_OFFSET);
-        if (wheels > 8)
+        for (index = 0; index < count; ++index)
+        {
+            uintptr_t actor = ReadU32(begin + index * 4u);
+            uint32_t kind = ReadU32(actor + ENTITY_KIND_OFFSET);
+            if (kind == CAR_KIND)
+                AddCandidateCar(cars, &total, actor);
+            else if (kind == TRAFFIC_MANAGER_KIND)
+            {
+                uintptr_t elements = ReadU32(actor + TRAFFIC_ELEMENTS_OFFSET);
+                uintptr_t elementCount = ReadU32(actor + TRAFFIC_COUNT_OFFSET), element;
+                if (elements < 0x10000u || !elementCount || elementCount > 256u ||
+                    !IsReadable((const void *)elements, elementCount * 4u))
+                    continue;
+                for (element = 0; element < elementCount; ++element)
+                {
+                    uintptr_t record = ReadU32(elements + element * 4u);
+                    if (record >= 0x10000u && ReadByte(record) != 0)
+                        AddCandidateCar(cars, &total, ReadU32(record + 0xCu));
+                }
+            }
+        }
+    }
+    if (crews >= 0x10000u && crewsEnd >= crews && (crewsEnd - crews) % 12u == 0 &&
+        crewsEnd - crews <= 12u * 64u && IsReadable((const void *)crews, crewsEnd - crews))
+        for (index = crews; index < crewsEnd; index += 12u)
+            AddCandidateCar(cars, &total, ReadU32(index));
+    return total;
+}
+
+typedef struct DriveByEntry
+{
+    DriveByTarget target;
+    float score;
+    int preferred;
+} DriveByEntry;
+#define MAX_DRIVE_ENTRIES 160
+
+static void AddDriveByEntry(DriveByEntry *entries, int *count, DriveByTarget target, float score)
+{
+    if (*count < MAX_DRIVE_ENTRIES)
+    {
+        entries[*count].target = target;
+        entries[*count].preferred = 1;
+        entries[(*count)++].score = score;
+    }
+}
+
+/* Wheels, living officers and ambient patrol officers share one pool with equal priority. */
+static int CollectDriveByTargets(uintptr_t world, uintptr_t player, DriveByView *view,
+                                 DriveByEntry *entries)
+{
+    uintptr_t cars[MAX_CANDIDATE_CARS], carCount = CollectCars(world, cars), index;
+    uintptr_t begin, count;
+    int total = 0;
+    for (index = 0; index < carCount; ++index)
+    {
+        uintptr_t car = cars[index];
+        uint32_t wheel, wheels = ReadU32(car + CAR_WHEEL_COUNT_OFFSET);
+        if (car == view->car || wheels > 8)
             continue;
         for (wheel = 0; wheel < wheels; ++wheel)
         {
             Vector3 point;
             float score, radius;
             if (ReadPoliceWheel(car, wheel, &point, &radius) &&
-                DriveByCandidate(view, point, 0.12f, 0, &score) && score < best)
-            {
-                *result = (DriveByTarget){car, 1, wheel, point};
-                best = score;
-                found = 1;
-            }
+                DriveByCandidate(view, point, 0.12f, !IsMovingCar(car), &score))
+                AddDriveByEntry(entries, &total, (DriveByTarget){car, 1, wheel, point}, score);
         }
     }
-    if (found && !IsStoppedCar(view->car))
-        return 1;
-    wheelFound = found;
-    if (wheelFound)
-        wheelTarget = *result;
-    found = 0;
-    best = 1.0e20f;
-    for (index = 0; index < count; ++index)
+    if (ListBounds(world, &begin, &count))
     {
-        uintptr_t actor = ReadU32(begin + index * 4u);
-        Vector3 point;
-        float score;
-        if (actor == player || ReadU32(actor + ENTITY_KIND_OFFSET) != SCRIPTABLE_NPC_KIND ||
-            ReadU32(actor + ENTITY_TYPE_GROUP_OFFSET) != POLICE_GROUP ||
-            ReadU32(actor + 0x98u) || ReadU32(actor + 0x9Cu) ||
-            ReadByte(actor + 0x5Eu) != 0 || !IsLivePed(actor, &point))
-            continue;
-        point.y += 1.25f;
-        if (DriveByCandidate(view, point, 0.35f, 1, &score) && score < best)
+        for (index = 0; index < count; ++index)
         {
-            *result = (DriveByTarget){actor, 2, 0, point};
-            best = score;
-            found = 1;
+            uintptr_t actor = ReadU32(begin + index * 4u);
+            Vector3 point;
+            float score;
+            if (actor == player || ReadU32(actor + ENTITY_KIND_OFFSET) != SCRIPTABLE_NPC_KIND ||
+                !HostileGroup(ReadU32(actor + ENTITY_TYPE_GROUP_OFFSET)) ||
+                ReadU32(actor + 0x98u) || ReadU32(actor + 0x9Cu) ||
+                ReadByte(actor + 0x5Du) != 1 || ReadByte(actor + 0x5Eu) != 0 || !IsLivePed(actor, &point))
+                continue;
+            point.y += 1.25f;
+            if (DriveByCandidate(view, point, 0.35f, 0, &score))
+                AddDriveByEntry(entries, &total, (DriveByTarget){actor, 2, 0, point}, score);
         }
     }
     {
@@ -766,21 +907,112 @@ static int FindDriveByTarget(uintptr_t world, uintptr_t player, DriveByView *vie
                 if (!IsFinite(life) || life <= 0.0f)
                     continue;
                 point.y += 1.25f;
-                if (DriveByCandidate(view, point, 0.35f, 1, &score) && score < best)
-                {
-                    *result = (DriveByTarget){pedestrian, 3, 0, point};
-                    best = score;
-                    found = 1;
-                }
+                if (DriveByCandidate(view, point, 0.35f, 0, &score))
+                    AddDriveByEntry(entries, &total, (DriveByTarget){pedestrian, 3, 0, point}, score);
             }
         }
     }
-    if (!found && wheelFound)
     {
-        *result = wheelTarget;
-        return 1;
+        /* In a chase the tyres of moving cars come first; otherwise people on foot do. */
+        int chase = 0;
+        for (index = 0; index < (uintptr_t)total; ++index)
+            if (entries[index].target.kind == 1 && IsMovingCar(entries[index].target.owner))
+                chase = 1;
+        for (index = 0; index < (uintptr_t)total; ++index)
+            entries[index].preferred = entries[index].target.kind == 1 ?
+                IsMovingCar(entries[index].target.owner) : !chase;
     }
-    return found;
+    return total;
+}
+
+/* The held lock stays until it becomes invalid; a new lock is the target nearest the crosshair. */
+static int FindDriveByTarget(uintptr_t world, uintptr_t player, DriveByView *view,
+                             DriveByTarget *result)
+{
+    DriveByEntry entries[MAX_DRIVE_ENTRIES];
+    int count = CollectDriveByTargets(world, player, view, entries), index, best = -1;
+    for (index = 0; index < count; ++index)
+    {
+        DriveByTarget *t = &entries[index].target;
+        if (g_driveTarget.owner && t->owner == g_driveTarget.owner && t->kind == g_driveTarget.kind &&
+            t->wheel == g_driveTarget.wheel)
+        {
+            *result = *t;
+            return 1;
+        }
+        if (best < 0 || (entries[index].preferred && !entries[best].preferred) ||
+            (entries[index].preferred == entries[best].preferred && entries[index].score < entries[best].score))
+            best = index;
+    }
+    if (best < 0)
+        return 0;
+    *result = entries[best].target;
+    return 1;
+}
+
+/* Screen position of a point as angles from the crosshair axis; false when behind the camera. */
+static int DriveByScreenPosition(const DriveByView *view, Vector3 right, Vector3 up, Vector3 point,
+                                 float *sx, float *sy)
+{
+    Vector3 d = Subtract(point, view->cameraPosition);
+    float forward, side;
+    if (!Normalize(&d))
+        return 0;
+    forward = Dot(d, view->aimDirection);
+    side = Dot(d, right);
+    *sx = atan2f(side, forward);
+    *sy = atan2f(Dot(d, up), sqrtf(forward * forward + side * side));
+    return 1;
+}
+
+/* Direction: 1 right, 2 left, 3 up, 4 down. Picks the next target in that direction on screen. */
+static int SwitchDriveByTarget(uintptr_t world, uintptr_t player, DriveByView *view,
+                               const DriveByTarget *current, int direction, DriveByTarget *result)
+{
+    DriveByEntry entries[MAX_DRIVE_ENTRIES];
+    int count = CollectDriveByTargets(world, player, view, entries), index, best = -1;
+    Vector3 right, up, worldUp = {0.0f, 1.0f, 0.0f};
+    float baseX = 0.0f, baseY = 0.0f, bestCost = 1.0e20f;
+    int haveBase = 0;
+    right = (Vector3){worldUp.y * view->aimDirection.z - worldUp.z * view->aimDirection.y,
+                      worldUp.z * view->aimDirection.x - worldUp.x * view->aimDirection.z,
+                      worldUp.x * view->aimDirection.y - worldUp.y * view->aimDirection.x};
+    if (!Normalize(&right))
+        return 0;
+    up = (Vector3){view->aimDirection.y * right.z - view->aimDirection.z * right.y,
+                   view->aimDirection.z * right.x - view->aimDirection.x * right.z,
+                   view->aimDirection.x * right.y - view->aimDirection.y * right.x};
+    for (index = 0; index < count && !haveBase; ++index)
+    {
+        DriveByTarget *t = &entries[index].target;
+        if (t->owner == current->owner && t->kind == current->kind && t->wheel == current->wheel)
+            haveBase = DriveByScreenPosition(view, right, up, t->point, &baseX, &baseY);
+    }
+    if (!haveBase)
+        return 0;
+    for (index = 0; index < count; ++index)
+    {
+        DriveByTarget *t = &entries[index].target;
+        float x, y, along, across, cost;
+        if ((t->owner == current->owner && t->kind == current->kind && t->wheel == current->wheel) ||
+            !DriveByScreenPosition(view, right, up, t->point, &x, &y))
+            continue;
+        along = direction == 1 ? x - baseX : direction == 2 ? baseX - x :
+                direction == 3 ? y - baseY : baseY - y;
+        across = fabsf(direction <= 2 ? y - baseY : x - baseX);
+        if (along < 0.0087f)
+            continue;
+        cost = along + 0.5f * across;
+        if (cost < bestCost)
+        {
+            bestCost = cost;
+            best = index;
+        }
+    }
+    if (best < 0)
+        return 0;
+    *result = entries[best].target;
+    return 1;
 }
 
 static int TargetStillValid(uintptr_t world, uintptr_t player, uintptr_t target, Vector3 *position)
@@ -982,6 +1214,12 @@ static void ReloadConfig(LONGLONG now)
     g_cfg.switchStick = ClampInt((int)GetPrivateProfileIntA("aim", "target_switch_stick", 2, g_iniPath), 0, 2);
     g_prioritizeEnemies = GetPrivateProfileIntA("aim", "prioritize_enemies", 1, g_iniPath) != 0;
     g_vehicleAimEnabled = GetPrivateProfileIntA("aim", "vehicle_aim", 1, g_iniPath) != 0;
+    g_vehicleArcade = GetPrivateProfileIntA("aim", "vehicle_arcade", 1, g_iniPath) != 0;
+    g_vehicleOneShot = GetPrivateProfileIntA("aim", "vehicle_one_shot", 1, g_iniPath) != 0;
+    g_vehicleFreeCamera = GetPrivateProfileIntA("aim", "vehicle_free_camera", 1, g_iniPath) != 0;
+    g_cheatHealth = ClampInt((int)GetPrivateProfileIntA("cheats", "player_health", 0, g_iniPath), 0, 100000);
+    g_cheatAcceleration = (float)ClampInt((int)GetPrivateProfileIntA(
+        "cheats", "car_acceleration_percent", 100, g_iniPath), 100, 1000) / 100.0f;
     g_crouchToggleEnabled = GetPrivateProfileIntA("aim", "crouch_toggle", 1, g_iniPath) != 0;
     g_targetConeDot = cosf((float)ClampInt((int)GetPrivateProfileIntA(
         "aim", "target_cone_degrees", 20, g_iniPath), 5, 45) * PI_F / 180.0f);
@@ -1311,6 +1549,164 @@ static int       g_losBlockedChecks;
 static LONGLONG  g_nextSwitchAt;
 static int       g_acquirePending;
 
+__declspec(dllexport) int __cdecl AimArcadeShot(uintptr_t game, uintptr_t shooter,
+                                              Vector3 *origin, Vector3 *direction,
+                                              float *power, int *count)
+{
+    uintptr_t world, player;
+    uintptr_t car;
+    DriveByView view;
+    DriveByTarget target;
+    Vector3 corrected;
+    float standOff;
+    if (!g_vehicleArcade || !g_vehicleAimEnabled || !origin || !direction ||
+        !power || !count || !GetActiveWorld(&world, &player) || shooter != player ||
+        game != ReadU32(world + MISSION_GAME_OFFSET))
+        return 0;
+    car = ReadU32(player + 0x98u);
+    if (ReadU32(car + ENTITY_KIND_OFFSET) != CAR_KIND || ReadU32(player + 0xACu) != 0 ||
+        ReadU32(player + 0x9Cu) != 0 || ReadByte(player + 0xADAu) != 0 ||
+        ReadByte(car + 0x5Eu) != 0 || ReadU32(player + 0x1E8u) < 1 || ReadU32(player + 0x1E8u) > 3)
+    {
+        static int rejected;
+        if (car && rejected < 20)
+        {
+            ++rejected;
+            Log("player car shot ignored: kind=%lu seat=%lu link9C=%lu locked=%d car5E=%d weapon=%lu",
+                (unsigned long)ReadU32(car + ENTITY_KIND_OFFSET), (unsigned long)ReadU32(player + 0xACu),
+                (unsigned long)ReadU32(player + 0x9Cu), ReadByte(player + 0xADAu), ReadByte(car + 0x5Eu),
+                (unsigned long)ReadU32(player + 0x1E8u));
+        }
+        return 0;
+    }
+    if (!g_held || !ReadDriveByView(player, &view) || !FindDriveByTarget(world, player, &view, &target))
+    {
+        if (!g_vehicleOneShot)
+            return 0;
+        Log("player car manual shot: damage=%.1f; direction and spread retained", *power);
+        return 1;
+    }
+    corrected = Subtract(target.point, *origin);
+    if (!Normalize(&corrected))
+        return 0;
+    standOff = target.kind == 1 ? 4.0f : 2.0f;
+    origin->x = target.point.x - corrected.x * standOff;
+    origin->y = target.point.y - corrected.y * standOff;
+    origin->z = target.point.z - corrected.z * standOff;
+    direction->x = corrected.x * (standOff + 2.0f);
+    direction->y = corrected.y * (standOff + 2.0f);
+    direction->z = corrected.z * (standOff + 2.0f);
+    *count = 1;
+    Log("arcade player car shot: target=0x%08lX kind=%d damage=%.1f stand_off=%.1f",
+        (unsigned long)target.owner, target.kind, *power, standOff);
+    return 1;
+}
+
+__declspec(dllexport) float __cdecl AimArcadeHitDamage(uintptr_t game, uintptr_t victim,
+                                                      uintptr_t source, int type, float damage)
+{
+    uintptr_t world, player, car;
+    float health;
+    if (!g_vehicleArcade || !g_vehicleOneShot || !g_vehicleAimEnabled || type != 0 ||
+        !GetActiveWorld(&world, &player) || source != player ||
+        game != ReadU32(world + MISSION_GAME_OFFSET) ||
+        ReadU32(victim + ENTITY_KIND_OFFSET) != SCRIPTABLE_NPC_KIND ||
+        !HostileGroup(ReadU32(victim + ENTITY_TYPE_GROUP_OFFSET)) ||
+        ReadByte(victim + 0x5Du) != 1 || ReadByte(victim + 0x5Eu) != 0 ||
+        !IsReadable((const void *)(victim + ENTITY_HEALTH_OFFSET), 4))
+        return damage;
+    car = ReadU32(player + 0x98u);
+    if (ReadU32(car + ENTITY_KIND_OFFSET) != CAR_KIND || ReadU32(player + 0xACu) != 0 ||
+        ReadByte(player + 0xADAu) != 0 || ReadU32(player + 0x1E8u) < 1 || ReadU32(player + 0x1E8u) > 3)
+        return damage;
+    health = *(volatile float *)(victim + ENTITY_HEALTH_OFFSET);
+    if (!IsFinite(health) || health <= 0.01f || health > 1000.0f)
+        return damage;
+    Log("confirmed player car police hit: damage %.4f -> %.1f hp=%.1f", damage, health * 10.0f, health);
+    return health * 10.0f;
+}
+
+typedef struct WheelHitState
+{
+    uintptr_t world, car, wheel;
+    uint32_t guid, shot;
+    int hits;
+} WheelHitState;
+static WheelHitState g_wheelHits[64];
+static uint32_t g_nextWheelHit;
+
+__declspec(dllexport) int __cdecl AimArcadeWheelHit(uintptr_t game, uintptr_t car,
+                                                  uintptr_t source, int type, uintptr_t frame, uint32_t shot,
+                                                  uintptr_t *wheelOut, int *indexOut)
+{
+    uintptr_t world, player, wheels, wheel = 0;
+    uint32_t count, index, slot, guid;
+    WheelHitState *state = NULL;
+    if (!g_vehicleArcade || !g_vehicleAimEnabled || type != 0 || !shot || !wheelOut || !indexOut ||
+        !GetActiveWorld(&world, &player) || source != player ||
+        game != ReadU32(world + MISSION_GAME_OFFSET) ||
+        !IsHostileCar(car) ||
+        car == ReadU32(player + 0x98u) || ReadU32(ReadU32(player + 0x98u) + ENTITY_KIND_OFFSET) != CAR_KIND ||
+        ReadU32(player + 0xACu) != 0 || ReadByte(player + 0xADAu) != 0 ||
+        ReadU32(player + 0x1E8u) < 1 || ReadU32(player + 0x1E8u) > 3)
+        return 0;
+    count = ReadU32(car + CAR_WHEEL_COUNT_OFFSET);
+    wheels = ReadU32(car + CAR_WHEELS_OFFSET);
+    if (!count || count > 8 || !IsReadable((void *)wheels, count * 4u))
+        return 0;
+    for (index = 0; index < count; ++index)
+    {
+        uintptr_t candidate = ReadU32(wheels + index * 4u);
+        uintptr_t parent = frame ? ReadU32(frame + 0x120u) : 0;
+        uintptr_t model = ReadU32(candidate + 4u);
+        if (candidate && frame && (model == frame || (parent &&
+            (model == parent || ReadU32(candidate + 8u) == parent))) &&
+            IsReadable((void *)candidate, WHEEL_FLAGS_OFFSET + 4u) &&
+            !(ReadU32(candidate + WHEEL_FLAGS_OFFSET) & WHEEL_UNUSABLE_FLAG))
+        {
+            wheel = candidate;
+            break;
+        }
+    }
+    if (!wheel)
+    {
+        static int missed;
+        if (missed < 30)
+        {
+            ++missed;
+            Log("player hit police car without a usable wheel: frame=0x%08lX parent=0x%08lX wheels=%lu",
+                (unsigned long)frame, (unsigned long)(frame ? ReadU32(frame + 0x120u) : 0),
+                (unsigned long)count);
+        }
+        return 0;
+    }
+    guid = ReadU32(car + 0x18u);
+    for (slot = 0; slot < 64; ++slot)
+        if (g_wheelHits[slot].world == world && g_wheelHits[slot].car == car &&
+            g_wheelHits[slot].guid == guid && g_wheelHits[slot].wheel == wheel)
+            state = &g_wheelHits[slot];
+    if (!state)
+    {
+        state = &g_wheelHits[g_nextWheelHit++ % 64u];
+        *state = (WheelHitState){world, car, wheel, guid, 0, 0};
+    }
+    else if (!(ReadU32(wheel + WHEEL_FLAGS_OFFSET) & 0x80000000u))
+    {
+        state->shot = 0;
+        state->hits = 0;
+    }
+    *wheelOut = wheel;
+    *indexOut = (int)index;
+    if (state->hits && state->shot == shot)
+        return -1;
+    state->shot = shot;
+    if (state->hits < 2)
+        ++state->hits;
+    Log("confirmed player car tyre hit: car=0x%08lX wheel=%lu stage=%d",
+        (unsigned long)car, (unsigned long)index, state->hits);
+    return state->hits;
+}
+
 static void ReleaseAim(void)
 {
     if (g_held)
@@ -1322,6 +1718,7 @@ static void ReleaseAim(void)
     }
     g_held = 0;
     g_target = 0;
+    g_driveSwitch = 0;
     memset(&g_driveTarget, 0, sizeof(g_driveTarget));
     g_switchSide = 0;
     g_aimZone = 0;
@@ -1355,8 +1752,18 @@ static void RunAim(LONG *lx, LONG *ly, uintptr_t world, uintptr_t player, Vector
     if (driving)
     {
         DriveByView view;
-        DriveByTarget next;
-        if (!ReadDriveByView(player, &view) || !FindDriveByTarget(world, player, &view, &next))
+        DriveByTarget next = {0};
+        int found = ReadDriveByView(player, &view), switched = 0;
+        if (found && g_driveSwitch && g_driveTarget.owner)
+        {
+            switched = SwitchDriveByTarget(world, player, &view, &g_driveTarget, g_driveSwitch, &next);
+            Log("drive-by switch %s: %s", g_driveSwitch == 1 ? "right" : g_driveSwitch == 2 ? "left" :
+                g_driveSwitch == 3 ? "up" : "down", switched ? "next target" : "no target that way");
+        }
+        g_driveSwitch = 0;
+        if (found && !switched)
+            found = FindDriveByTarget(world, player, &view, &next);
+        if (!found)
         {
             g_target = 0;
             memset(&g_driveTarget, 0, sizeof(g_driveTarget));
@@ -1364,7 +1771,11 @@ static void RunAim(LONG *lx, LONG *ly, uintptr_t world, uintptr_t player, Vector
             g_prevError = -1.0f;
             if (now >= g_noTargetLogAt)
             {
-                Log("drive-by: no police target in left sector with clear firing line");
+                uintptr_t cars[MAX_CANDIDATE_CARS], total = CollectCars(world, cars), index;
+                unsigned hostile = 0;
+                for (index = 0; index < total; ++index)
+                    hostile += IsHostileCar(cars[index]) != 0;
+                Log("drive-by: no target (cars %lu, hostile %u)", (unsigned long)total, hostile);
                 g_noTargetLogAt = now + 1500;
             }
             return;
@@ -1375,7 +1786,7 @@ static void RunAim(LONG *lx, LONG *ly, uintptr_t world, uintptr_t player, Vector
             g_prevError = -1.0f;
             g_remX = g_remY = 0.0f;
             g_stallX = g_stallY = 0;
-            Log("drive-by target 0x%08lX kind=%d wheel=%lu: left sector and firing line clear",
+            Log("drive-by target 0x%08lX kind=%d wheel=%lu",
                 (unsigned long)next.owner, next.kind, (unsigned long)next.wheel);
         }
         g_driveTarget = next;
@@ -1569,6 +1980,153 @@ static int      g_haveAngles;
 static float    g_prevYaw, g_prevPitch;
 static LONG     g_curX, g_curY; /* counts delivered since the previous measurement */
 
+#define FREE_LOOK_RVA 0x1DAAD0u
+typedef void (__fastcall *EnableFreeLookFn)(void *camera, void *unused, int enable, int forceChase);
+
+/* Optional test cheats: raised health ceiling and a motor-force multiplier on the player's own car. */
+static void ApplyPlayerCheats(uintptr_t player, uintptr_t car)
+{
+    static uintptr_t boostedCar;
+    static float baseFactor, writtenFactor;
+    int wantBoost = g_cheatAcceleration > 1.0f && car && ReadU32(car + ENTITY_KIND_OFFSET) == CAR_KIND &&
+        ReadU32(player + 0xACu) == 0 && ReadU32(player + 0x9Cu) == 0;
+    if (g_cheatHealth > 0 && ReadByte(player + 0x5Du) == 1 && IsReadable((const void *)(player + 0x604u), 0x44u))
+    {
+        volatile float *ceiling = (volatile float *)(player + 0x604u);
+        volatile float *health = (volatile float *)(player + 0x644u);
+        if (IsFinite(*health) && *health > 0.0f && *ceiling < (float)g_cheatHealth)
+        {
+            *ceiling = (float)g_cheatHealth;
+            *health = (float)g_cheatHealth;
+            Log("cheat: player health set to %d", g_cheatHealth);
+        }
+    }
+    if (boostedCar && (boostedCar != car || !wantBoost) && IsReadable((const void *)(boostedCar + 0x2A0u), 4) &&
+        ReadU32(boostedCar + ENTITY_KIND_OFFSET) == CAR_KIND &&
+        *(volatile float *)(boostedCar + 0x2A0u) == writtenFactor)
+    {
+        *(volatile float *)(boostedCar + 0x2A0u) = baseFactor;
+        boostedCar = 0;
+    }
+    if (wantBoost && IsReadable((const void *)(car + 0x2A0u), 4))
+    {
+        volatile float *factor = (volatile float *)(car + 0x2A0u);
+        if (boostedCar != car || *factor != writtenFactor)
+            baseFactor = *factor;
+        if (IsFinite(baseFactor) && baseFactor > 0.0f && baseFactor <= 4.0f)
+        {
+            writtenFactor = baseFactor * g_cheatAcceleration;
+            *factor = writtenFactor;
+            if (boostedCar != car)
+                Log("cheat: car motor force x%.2f", g_cheatAcceleration);
+            boostedCar = car;
+        }
+    }
+}
+
+/* Records the player's weapon/aim bytes around a collision with the own car (what holsters the weapon). */
+static void TraceCollisionAftermath(uintptr_t player, uintptr_t car)
+{
+    static uint32_t lastDamage;
+    static uintptr_t lastCar;
+    static DWORD until, nextLog;
+    static int traced;
+    uint32_t damage = ReadU32(car + 0x2154u);
+    DWORD tick = GetTickCount();
+    if (car != lastCar)
+    {
+        lastCar = car;
+        lastDamage = damage;
+        until = 0;
+        return;
+    }
+    if (damage != lastDamage)
+    {
+        Log("own car collision damage bytes %08lX>%08lX", (unsigned long)lastDamage, (unsigned long)damage);
+        lastDamage = damage;
+        until = tick + 2000;
+        nextLog = 0;
+    }
+    if (until && (int)(until - tick) > 0 && tick >= nextLog && traced < 40)
+    {
+        ++traced;
+        nextLog = tick + 150;
+        Log("collision aftermath: hp=%.1f state=%lu weapon=%lu f1E5=%d f1EC=%d f1FE=%d f21C=%d fAF5=%d f581=%d model=%d",
+            ReadU32(player + 0x644u) ? *(volatile float *)(player + 0x644u) : 0.0f,
+            (unsigned long)ReadU32(player + 0x40Cu), (unsigned long)ReadU32(player + 0x1E8u),
+            ReadByte(player + 0x1E5u), ReadByte(player + 0x1ECu), ReadByte(player + 0x1FEu),
+            ReadByte(player + 0x21Cu), ReadByte(player + 0xAF5u), ReadByte(player + 0x581u),
+            ReadU32(player + 0x564u) != 0);
+    }
+}
+
+static void TraceDriverState(uintptr_t player, uintptr_t car, uintptr_t camera)
+{
+    static uint32_t last[6];
+    static uintptr_t lastCar;
+    static int traced;
+    uint32_t now[6];
+    now[0] = ReadU32(player + 0x1E8u);
+    now[1] = ReadU32(player + 0x40Cu);
+    now[2] = (uint32_t)ReadByte(player + 0xADAu);
+    now[3] = ReadU32(player + 0x564u) != 0;
+    now[4] = ReadU32(camera + 0x10u);
+    now[5] = (uint32_t)ReadByte(car + 0x5Eu);
+    if (car != lastCar)
+    {
+        lastCar = car;
+        memcpy(last, now, sizeof(last));
+        return;
+    }
+    if (!memcmp(last, now, sizeof(last)) || traced >= 40)
+        return;
+    ++traced;
+    Log("driver state change: weapon %lu>%lu state %lu>%lu locked %lu>%lu model %lu>%lu cam %lu>%lu car5E %lu>%lu",
+        (unsigned long)last[0], (unsigned long)now[0], (unsigned long)last[1], (unsigned long)now[1],
+        (unsigned long)last[2], (unsigned long)now[2], (unsigned long)last[3], (unsigned long)now[3],
+        (unsigned long)last[4], (unsigned long)now[4], (unsigned long)last[5], (unsigned long)now[5]);
+    memcpy(last, now, sizeof(last));
+}
+
+/* Keeps the native chase camera behind the car and rotatable through the aiming input. */
+static void UpdateDriverCamera(uintptr_t world, uintptr_t player, uintptr_t car)
+{
+    static const BYTE entry[] = {0x8A, 0x81, 0x94, 0, 0, 0, 0x84, 0xC0, 0x75, 0x14};
+    static uintptr_t activeCar;
+    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    uintptr_t camera = ReadU32(world + MISSION_GAME_OFFSET) + 0x4Cu;
+    EnableFreeLookFn enable = (EnableFreeLookFn)(base + FREE_LOOK_RVA);
+    uint32_t mode;
+    int wanted;
+    if (car)
+    {
+        TraceDriverState(player, car, camera);
+        TraceCollisionAftermath(player, car);
+    }
+    if ((!g_vehicleFreeCamera && !activeCar) || !IsReadable((const void *)(base + FREE_LOOK_RVA), sizeof(entry)) ||
+        memcmp((const void *)(base + FREE_LOOK_RVA), entry, sizeof(entry)) != 0 ||
+        !IsReadable((const void *)camera, 0x98u))
+        return;
+    mode = ReadU32(camera + 0x10u);
+    wanted = g_vehicleFreeCamera && car && ReadU32(car + ENTITY_KIND_OFFSET) == CAR_KIND &&
+        ReadU32(player + 0xACu) == 0 && ReadU32(player + 0x9Cu) == 0 &&
+        ReadByte(player + 0xADAu) == 0 && mode >= 7u && mode <= 0xFu;
+    if (wanted && ReadByte(camera + 0x94u) == 0)
+    {
+        enable((void *)camera, NULL, 1, activeCar != car);
+        Log("driver camera: free look enabled (mode %lu, %s)", (unsigned long)mode,
+            activeCar != car ? "locked behind the car" : "kept");
+        activeCar = car;
+    }
+    else if (activeCar && (!car || !g_vehicleFreeCamera))
+    {
+        if (ReadByte(camera + 0x94u) == 1)
+            enable((void *)camera, NULL, 0, 0);
+        Log("driver camera: native camera restored");
+        activeCar = 0;
+    }
+}
+
 static void HandleMouse(LONG *lx, LONG *ly)
 {
     uintptr_t world, player;
@@ -1606,7 +2164,12 @@ static void HandleMouse(LONG *lx, LONG *ly)
         g_crouchPlayer = 0;
         g_crouchDesired = -1;
     }
-    if (g_cfg.stickLook && g_padOk && (!g_target || car))
+    if (active)
+    {
+        UpdateDriverCamera(world, player, car);
+        ApplyPlayerCheats(player, car);
+    }
+    if (g_cfg.stickLook && g_padOk && !g_target)
         AddStickLook(lx, ly, dt);
 
     held = AimButtonHeld();
@@ -1617,6 +2180,15 @@ static void HandleMouse(LONG *lx, LONG *ly)
         g_held = 1;
         g_acquirePending = 1;
         Log("press: gain=%.6f,%.6f", g_axis[0].gain, g_axis[1].gain);
+    }
+    if (held && car && g_target)
+    {
+        int flick = StickFlick();
+        int heightFlick = AimHeightFlick();
+        if (flick)
+            g_driveSwitch = flick > 0 ? 1 : 2;
+        else if (heightFlick)
+            g_driveSwitch = heightFlick > 0 ? 3 : 4;
     }
     if (held && !car)
     {

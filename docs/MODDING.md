@@ -145,6 +145,61 @@ quiet guard and allied bodyguard. Combine personality, senses, weapon/accuracy/h
 
 ### Driver Police Aim
 
+Arcade follow-up (2026-10-07): vehicle_arcade=1 and vehicle_one_shot=1 are defaults. The geometric mode below
+remains available with vehicle_arcade=0. Arcade removes side/elevation/LOS restrictions for driver target selection,
+retains living-police/tyre priorities and ignores civilians. Visible mouse aiming was restored after the user
+reported losing aim: the original arcade early return selected a target but suppressed all mouse correction.
+It is deliberately a single-player cheat: redirected bullets start0.5m before the current target point, including
+through-cover targets. That0.5m origin was replaced on2026-10-07 with2m for officers/4m for tyres after the user
+reported no one-shot despite callback logs. Starting inside a collider is a plausible miss cause, not yet proven
+in a runtime hit trace. This is not a physically plausible muzzle ray and changes where native effects originate.
+
+Host intercepts ONLY human_shooting calls RVAsA5145/A5CEA to Game::NewShoot RVA1E3DF0. Verify prologue
+81 EC D4 00 00 00, both E8 signatures, and ret2C at VA5E47B8. PC passes two vec3s BY VALUE on the stack,
+unlike the PS2 reference signatures; ECX=game, first stack arg=shooter. Synthetic tests execute both patched
+caller layouts with44-byte native argument cleanup and preserve world/owner/effect/frame on the original call.
+No manual Hit/Death/Explosion call or health write is introduced. Real native fire still controls ammo/cadence.
+
+Reloadable export AimArcadeShot validates active game, shooter==active player, occupied car, driver seat,
+firearm and (for redirection) held LT/O plus a freshly valid target. It supplies corrected origin/ray displacement,
+count1 (no spread), retaining the weapon's original projectile damage. The second vec3 is a RAY DISPLACEMENT, not a unit
+direction: native NewShoot VA5E3ECE computes sqrt(length_squared) and5E3ED0 stores the bullet range at
+stack+7C (S_shoot+18, record base+64). Unit vectors produced one-metre bullets that could not reach the2m/4m
+stand-off targets. Corrected displacement lengths are4m for officers/6m for tyres, passing the target by2m.
+Runtime: the previous build produced player-owned damage10000/range4 bullets, but confirmed police torso
+Hit received damage0 and health stayed100. Increasing projectile damage did not establish a lethal native hit.
+Host trace also records range. Tests assert the ray intersects the target BEFORE expiry.
+Unlocked/no-target PLAYER-DRIVER shots retain native origin/direction/damage/count.
+NPC/on-foot/wrong-world callbacks return unchanged. One-shot is now applied at the confirmed police Hit below.
+Local NewShoot binary VA5E3E49 loads the float argument and5E3E6F stores it at stack+8C: record base+64,
+S_shoot damage+28. Owner is stored at+90 (record+2C). The increased argument is therefore damage, not range;
+callback execution alone still does NOT prove collision or a kill. Tests cover visible aim, standoff and manual
+damage without lock/stale camera; engine hit/one-shot behavior must be confirmed in-game.
+Exceptions disable only this callback and forward the original shot. Existing native invulnerability, scripts,
+per-model collision and tyre/rim boundaries mean actual guaranteed hits/kills are NOT runtime-certified yet.
+Shot/mouse/crouch callbacks take a shared SRW lock; reload swaps/unloads under the exclusive lock, replacing
+the earlier bounded in-flight wait. Host ABI changes require restart. No commit/push requested for this follow-up.
+
+Confirmed-hit policy (2026-10-07): ENTITY->HumanHit parent call RVA1223B (E8 D0 44 08 00) targets RVA96710.
+Eight stack arguments, ret20, boolean result in AL (native return VA498603 clears AL; VA498578 sets it).
+AimArcadeHitDamage modifies ONLY bullet type0, active-player driver firearm source, arcade/aim/one-shot enabled,
+living scripted police group2. Incoming zero damage becomes10*current health; original HumanHit owns damage,
+death, animation and scripts. No direct health/death writes. Other damage arguments and AL returns are preserved.
+
+Confirmed wheel hits: C_car vtable RVA23BC08 slot31 and extended table RVA23BD68 slot31 both point to
+CarHit RVA6A670 (81 EC F0 00 00 00), eight stack args/ret20/boolean AL. Native matching VA46A97E-46A994
+accepts wheel+4==hit frame, or hit-frame parent+120 equal to wheel+4 or wheel+8. The adapter mirrors this.
+Only active-player driver firearm hits on police cars are counted. A bounded64-entry cache keys mission/car/GUID18/
+wheel, counts confirmed hits rather than trigger presses, and suppresses repeated notifications for one player
+shot sequence. Cache resets on logic reload; changed identity or restored unpunctured wheel starts over.
+First hit retains CarHit effects with damage0 and sets wheel+120 puncture80000000, matching native VA46A9F1.
+Second hit calls wheel-dropout RVA6E0C0: ECX=car, EDX=index, two vector pointers on stack, ret8 VA46E19E.
+The first vector is release motion, supplied as zero; optional impulse is NULL. Native code creates the physical
+temporary and sets detached40000000 only after success; the mod does not merely hide a model or set that flag.
+Normal projectile damage is retained to avoid making off-target car-body shots artificially explosive.
+Harness covers scope, child frames, distinct wheels, duplicate notifications, identity reuse, native ABI and AL.
+Runtime death animation, wheel burst and wheel-dropout effects are not yet confirmed for this build.
+
 `vehicle_aim=1` enables driver-seat-only LT/O lock-on. GetActiveWorld permits cars, while GetWorld remains
 on-foot-only for B crouch (B can therefore be the brake). No shot/AI/physics setter is called by this feature.
 While moving, the target order is police tyres, then the best reachable living foot cop across scripted

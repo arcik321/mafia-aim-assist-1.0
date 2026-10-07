@@ -31,6 +31,21 @@
     { "name": "npc_hearing", "rva": "0x00032540", "bytes": "8B 41 24 D9 80 70 06 00", "abi": "thiscall(), float in ST0, receiver entity+0xEBC" },
     { "name": "vehicle_wheel_count", "rva": "0x000F5AB0", "bytes": "8B 81 40 05 00 00 C3", "abi": "read-only layout evidence: C_Vehicle+0x540 = C_car+0x5B0" },
     { "name": "vehicle_wheel_at", "rva": "0x000F5AC0", "bytes": "8B 81 B4 0C 00 00 8B 4C 24 04 8B 04 88 C2 04 00", "abi": "read-only layout evidence: C_Vehicle+0xCB4 = C_car+0xD24 wheel pointer array" },
-    { "name": "driver_active_aim_camera", "rva": "0x000C9C8F", "bytes": "8B 0D 5C 11 65 00 8B 51 10 8B BA 7C 01 00 00", "abi": "driver shooting loads mission+0x10 scene, scene+0x17C active camera; not a hook" }
+    { "name": "driver_active_aim_camera", "rva": "0x000C9C8F", "bytes": "8B 0D 5C 11 65 00 8B 51 10 8B BA 7C 01 00 00", "abi": "driver shooting loads mission+0x10 scene, scene+0x17C active camera; not a hook" },
+    { "name": "game_new_shoot", "rva": "0x001E3DF0", "bytes": "81 EC D4 00 00 00", "abi": "thiscall(actor,vec3 BY VALUE,vec3 BY VALUE,float,int,frame,int); ret0x2C at VA005E47B8" },
+    { "name": "human_shoot_call_a", "rva": "0x000A5145", "bytes": "E8 A6 EC 13 00", "abi": "human_shooting callsite; ECX=game, shooter=human; two by-value vectors" },
+    { "name": "human_shoot_call_b", "rva": "0x000A5CEA", "bytes": "E8 01 E1 13 00", "abi": "second human_shooting callsite; same0x2C stack cleanup" },
+    { "name": "shoot_damage_argument_load", "rva": "0x001E3E49", "bytes": "8B 84 24 F8 00 00 00", "abi": "float argument bits into EAX after saved EBP; native record construction" },
+    { "name": "shoot_damage_record_store", "rva": "0x001E3E6F", "bytes": "89 84 24 8C 00 00 00", "abi": "EAX into S_shoot damage+0x28, stack record base+0x64" },
+    { "name": "shoot_ray_length_range_store", "rva": "0x001E3ECE", "bytes": "D9 FA D9 5C 24 7C", "abi": "FSQRT then range=ray length at S_shoot+0x18; second by-value vec3 is NOT unit direction" },
+    { "name": "entity_human_hit_call", "rva": "0x0001223B", "bytes": "E8 D0 44 08 00", "abi": "parent HumanHit thiscall, eight stack arguments, ret0x20" },
+    { "name": "car_hit", "rva": "0x0006A670", "bytes": "81 EC F0 00 00 00", "abi": "thiscall, eight stack arguments, ret0x20; vtable slot31" },
+    { "name": "car_hit_slot", "rva": "0x0023BC84", "bytes": "70 A6 46 00", "abi": "C_car vtable slot31 points to native CarHit" },
+    { "name": "car_extended_hit_slot", "rva": "0x0023BDE4", "bytes": "70 A6 46 00", "abi": "extended car vtable slot31 points to native CarHit" },
+    { "name": "car_prepare_wheel_dropout", "rva": "0x0006E0C0", "bytes": "83 EC 2C 8B 81 24 0D 00 00", "abi": "fastcall: ECX car, EDX wheel index, two vector pointer stack arguments; ret8 at VA46E19E" },
+    { "name": "camera_enable_free_look", "rva": "0x001DAAD0", "bytes": "8A 81 94 00 00 00 84 C0 75 14", "abi": "thiscall(bool enable, bool forceChaseMode7), receiver C_game+0x4C, ret8 at VA5DAB27; byte camera+0x94 is the enabled flag" },
+    { "name": "traffic_element_vector_walk", "rva": "0x000F66CD", "bytes": "8B 46 74 4F 8B 04 B8 85 C0 74 6D 8B 40 0C", "abi": "read-only evidence: traffic manager (kind 0xC) +0x74 is an array of S_ELEMENT pointers, count +0x220; element+0xC is the C_car" },
+    { "name": "mafia_crew_vector_reset", "rva": "0x000F653C", "bytes": "A3 70 61 65 00 A3 74 61 65 00", "abi": "read-only evidence: spawned mafia crew vector begin/end at RVA 0x256170/0x256174, stride 0xC {car, driver, passenger}" },
+    { "name": "vehicle_motor_force_factor", "rva": "0x0012DFE2", "bytes": "D8 8E 30 02 00 00", "abi": "read-only evidence: vehicle_compute_motor_force multiplies drive force by C_Vehicle+0x230 (= C_car+0x2A0), reset to 1.0 at VA521D59 and recomputed from engine damage" }
   ]
 }
